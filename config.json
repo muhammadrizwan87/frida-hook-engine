@@ -1,0 +1,585 @@
+{
+  // ========================================================================
+  // Frida Gadget configuration — libfrida-gadget.config.so
+  //
+  // Loads libfrida-gadget.script.so in Script interaction mode and passes
+  // every key under "parameters" to the script's init(). Any key absent
+  // here falls back to the script's module-level default.
+  //
+  // Written in JSONC (JSON with comments). If your Gadget build parses
+  // strictly, strip the comments before deployment.
+  //
+  // Convention: each *Enabled boolean gates a module; the companion object
+  // immediately below it (e.g. geoSpoofValues) supplies that module's
+  // values and is ignored while its flag is false.
+  // ========================================================================
+  "interaction": {
+    "type": "script",
+    "path": "libfrida-gadget.script.so",
+    // "reload" | "restart" | "none" — how Gadget reacts to a config change.
+    // "reload" re-runs init() without restarting the app; "restart" reboots
+    // the target process; "none" disables detection.
+    "on_change": "reload",
+    "parameters": {
+
+      // ------------------------------------------------------------------
+      // Engine-level
+      // ------------------------------------------------------------------
+      // Route engine output to android.util.Log (tag "FridaHookEngine").
+      // Also gates per-call debug output from every module. Set false once
+      // everything is verified, to silence logcat noise.
+      "debugLog": false,
+
+      // ------------------------------------------------------------------
+      // Installer-source spoofing
+      // ------------------------------------------------------------------
+      // Reports "com.android.vending" (Play Store) as the installer across
+      // the deprecated PackageManager.getInstallerPackageName() and the
+      // three-field InstallSourceInfo (installing / initiating / originating).
+      "installerSpoofEnabled": false,
+
+      // ------------------------------------------------------------------
+      // ADB / Developer Options detection bypass
+      // ------------------------------------------------------------------
+      // Forces Settings.Secure/Global getInt/getString for
+      // "development_settings_enabled" and "adb_enabled" to "0".
+      "adbDevSettingsBypassEnabled": false,
+
+      // ------------------------------------------------------------------
+      // Mock-location detection bypass
+      // ------------------------------------------------------------------
+      // Forces Location.isMock()/isFromMockProvider() to false, and
+      // AppOpsManager OPSTR_MOCK_LOCATION queries to MODE_IGNORED.
+      "mockLocationBypassEnabled": false,
+      
+      // ------------------------------------------------------------------
+      // Auto-time / auto-timezone spoofing
+      // ------------------------------------------------------------------
+      // Forces Settings.Global "auto_time" and "auto_time_zone" to always
+      // report "1" (automatic mode) across Settings.Secure/Global/System
+      // getInt/getString and, when contentProviderSpoofEnabled is also
+      // true, across ContentResolver.query()/call(). Apps reading these
+      // keys see a device whose clock is not manually managed.
+      "autoTimeSpoofEnabled": false,
+      
+      // ------------------------------------------------------------------
+      // PairIP license-check NOP
+      // ------------------------------------------------------------------
+      // Replaces com.pairip.licensecheck.LicenseClient.bindToLicensingService
+      // (boolean) with an empty implementation; the app never binds to the
+      // PairIP licensing service, but its execution flow continues
+      // uninterrupted. Provided as a dedicated toggle (rather than a
+      // javaHooks entry) because the target is fixed and the config surface
+      // stays minimal.
+      // NOTE: not a paid/commercial license bypass. This only unblocks a
+      // free app's client-side PairIP check inside a virtualized/emulated
+      // research environment.
+      "pairipLicenseBypassEnabled": false,
+    
+      // ------------------------------------------------------------------
+      // FLAG_SECURE bypass
+      // ------------------------------------------------------------------
+      // Strips WindowManager.LayoutParams.FLAG_SECURE (0x2000) from
+      // Window flags, Window.setAttributes(), SurfaceView.setSecure(), and
+      // WindowManagerImpl.addView/updateViewLayout(). Allows screenshot /
+      // screen recording of protected surfaces.
+      "flagSecureBypassEnabled": false,
+
+      // ------------------------------------------------------------------
+      // VPN / proxy detection bypass
+      // ------------------------------------------------------------------
+      // Hides tun/ppp/tap NetworkInterfaces, TRANSPORT_VPN, and proxy
+      // configuration from NetworkInterface, NetworkCapabilities,
+      // NetworkInfo, ConnectivityManager, System.getProperty, and Proxy.
+      "vpnProxyBypassEnabled": false,
+
+      // ------------------------------------------------------------------
+      // SSL / TLS certificate-pinning bypass
+      // ------------------------------------------------------------------
+      // Java layer: SSLContext, TrustManagerFactory, HttpsURLConnection,
+      // OkHttp CertificatePinner, Android Network Security Config,
+      // TrustKit, Appmattus CT — plus reflection scans over live
+      // X509TrustManager / HostnameVerifier instances for obfuscated builds.
+      // Native layer: for Flutter apps (libflutter.so present), locates
+      // BoringSSL's verify function by string-anchor + ADRP cross-reference
+      // and forces its return to 1. ARM64-only on the native side.
+      "sslPinningBypassEnabled": false,
+
+      // ------------------------------------------------------------------
+      // Geo / carrier identity spoofing
+      // ------------------------------------------------------------------
+      // Overrides carrier name, PLMN, and network/SIM country across
+      // TelephonyManager and SubscriptionInfo. Independent of
+      // localeSpoofEnabled — useful when you want content-availability
+      // checks spoofed without changing displayed language.
+      "geoRestrictionBypassEnabled": false,
+      // operatorName — carrier display name (informational string).
+      // plmn         — MCC+MNC, exactly 5 or 6 digits. Malformed lengths
+      //                fall back to the module's built-in default for the
+      //                MCC/MNC-derived getters.
+      // countryIso   — ISO-3166-1 alpha-2, lowercase.
+      "geoSpoofValues": {
+        "operatorName": "AT&T",
+        "plmn": "310410",
+        "countryIso": "us"
+      },
+
+      // ------------------------------------------------------------------
+      // Locale / timezone spoofing
+      // ------------------------------------------------------------------
+      // Rewrites Locale.getCountry/getLanguage, the JVM default Locale
+      // (including DISPLAY and FORMAT categories), TimeZone.getID,
+      // Configuration.getLocales(), and LocaleList.getDefault().
+      // Independent of geoRestrictionBypassEnabled.
+      "localeSpoofEnabled": false,
+      // country    — ISO-3166-1 alpha-2, uppercase.
+      // language   — ISO-639-1, lowercase.
+      // timezoneId — IANA zone ID.
+      "localeSpoofValues": {
+        "country": "US",
+        "language": "en",
+        "timezoneId": "America/New_York"
+      },
+
+      // ------------------------------------------------------------------
+      // Suspicious-package hiding
+      // ------------------------------------------------------------------
+      // Filters the configured packages out of PackageManager and
+      // LauncherApps enumeration / lookup APIs (both legacy int flags and
+      // API 33+ PackageInfoFlags / ApplicationInfoFlags / ResolveInfoFlags
+      // overloads), and throws NameNotFoundException on direct lookups.
+      // No built-in list — an empty list hides nothing by design.
+      "suspiciousPackageSpoofEnabled": false,
+      // Package names to hide. Case-insensitive comparison.
+      "suspiciousPackagesCustom": [
+        "bin.mt.plus",
+        "com.network.proxy",
+        "com.termux"
+      ],
+      
+      // ------------------------------------------------------------------
+      // Fake-installed-package spoofing
+      // ------------------------------------------------------------------
+      // Makes configured packages appear installed to the target app even
+      // though they aren't actually present on the device. Fabricated
+      // PackageInfo/ApplicationInfo objects carry plausible fields
+      // (versionCode, uid, sourceDir, FLAG_INSTALLED) so common checks
+      // pass. Covers both direct lookups and enumeration APIs.
+      //
+      // The inverse of suspiciousPackageSpoofEnabled — this ADDS packages
+      // to lookups, that one REMOVES them.
+      //
+      // Not covered: resolveActivity() / queryIntentActivities() — a
+      // fabricated package has no real activities.
+      "installedPackageSpoofEnabled": false,
+      // Map of { packageName: { versionName?, versionCode?, uid?, isSystem? } }.
+      // All fields are optional strings; the module supplies defaults:
+      //   versionName  "1.0.0"
+      //   versionCode  "1"
+      //   uid          "10123"    (must be >= 10000; lower values are rejected)
+      //   isSystem     "false"    ("true" sets FLAG_SYSTEM on ApplicationInfo)
+      // An empty inner object {} is valid — all defaults apply.
+      "installedPackageSpoofValues": {
+        "com.android.vending": {
+          "versionName": "53.3.21-34 [0] [PR] 986224237",
+          "versionCode": "85332140",
+          "uid": "10159",
+          "isSystem": "true"
+        },
+        "com.google.android.gms": {
+          "versionName": "26.34.36 (260400-981326859)",
+          "versionCode": "263436035",
+          "uid": "14134",
+          "isSystem": "true"
+        },
+        "com.google.android.gsf": {
+          "versionName": "14134",
+          "versionCode": "36",
+          "uid": "14134",
+          "isSystem": "true"
+        }
+      },
+
+      // ------------------------------------------------------------------
+      // Device-identifier spoofing
+      // ------------------------------------------------------------------
+      // Covers TelephonyManager (IMEI / MEID / ICCID / IMSI / line number),
+      // NetworkInterface.getHardwareAddress, WifiInfo.getMacAddress and
+      // getIpAddress, BluetoothAdapter.getAddress, Google Play Services +
+      // androidx.ads.identifier advertising IDs, and SubscriptionInfo
+      // ICCID / phone-number getters.
+      //
+      // ANDROID_ID is delivered via the shared Settings hook — it is not a
+      // direct TelephonyManager read — so the effective value is combined
+      // with adbDevSettingsBypassEnabled and mockLocationBypassEnabled in
+      // the script's init().
+      "deviceIdSpoofEnabled": false,
+      // When true, fresh random values are generated once at init() and
+      // used for every identifier, ignoring deviceIdSpoofValues. IMEI and
+      // ICCID include a valid Luhn check digit; MACs are drawn from real
+      // consumer-device OUI prefixes.
+      "deviceIdSpoofUseRandom": false,
+      // Fixed profile used when deviceIdSpoofUseRandom is false.
+      // Closed key set. MAC addresses are validated (6 hex octets,
+      // colon-separated); an invalid value falls back to the module default.
+      "deviceIdSpoofValues": {
+        "androidId": "a1b2c3d4e5f6a7b8",
+        "imei": "356938035643809",
+        "meid": "A1000012B3C456",
+        "iccid": "89014103211118510720",
+        "imsi": "310260123456789",
+        "phoneNumber": "+15555215556",
+        "wifiMac": "3C:5A:B4:1E:2F:8D",
+        "bluetoothMac": "AC:37:43:2B:9C:14",
+        "advertisingId": "38400000-8cf0-11bd-b23e-10b96e40000d",
+        "internalIp": "192.168.1.42"
+      },
+
+      // ------------------------------------------------------------------
+      // Build-prop (Tier-A device identity) spoofing
+      // ------------------------------------------------------------------
+      // Mutates android.os.Build.* and Build.VERSION.* public static final
+      // fields in place, and hooks Build.getSerial() / getRadioVersion().
+      // Every reader — including internal framework code — observes the
+      // spoofed values, since only one field slot exists.
+      //
+      // Deliberately excluded: SDK_INT and the SUPPORTED_*_ABIS lists.
+      // SDK_INT commonly gates the app's own code paths, and spoofing ABIs
+      // risks crashing the app if it later loads a native library for an
+      // architecture the device doesn't actually have.
+      "buildPropSpoofEnabled": false,
+      // Closed key set — only the keys below are accepted; any other key
+      // is ignored with a warning. All values are strings.
+      "buildPropSpoofValues": {
+        "manufacturer": "Google",
+        "model": "Pixel 7 Pro",
+        "brand": "google",
+        "product": "cheetah",
+        "device": "cheetah",
+        "hardware": "cheetah",
+        "board": "cheetah",
+        "bootloader": "unknown",
+        "host": "android-build",
+        "id": "AP4A.241205.013",
+        "fingerprint": "google/cheetah/cheetah:15/AP4A.241205.013/12621605:user/release-keys",
+        "tags": "release-keys",
+        "type": "user",
+        "user": "android-build",
+        "display": "AP4A.241205.013",
+        "release": "15",
+        "securityPatch": "2024-12-05",
+        "incremental": "12621605",
+        "codename": "REL"
+      },
+
+      // ------------------------------------------------------------------
+      // System-property spoofing
+      // ------------------------------------------------------------------
+      // Hooks android.os.SystemProperties.get(String) and get(String, String)
+      // — the hidden-API methods every raw ro.* / persist.* / qemu.* read
+      // ultimately goes through. Covers bootloader-lock-state and classic
+      // emulator-artifact keys that Build has no field for.
+      //
+      // Independent of buildPropSpoofEnabled. Build's own fields are
+      // populated from these properties only once, at Build's class-init
+      // time — hooking here does not retroactively change them; use
+      // buildPropSpoofEnabled for those.
+      "systemPropertySpoofEnabled": false,
+      // Open-ended key set — any property name is accepted.
+      "systemPropertySpoofValues": {
+        "ro.boot.verifiedbootstate": "green",
+        "ro.boot.vbmeta.device_state": "locked",
+        "ro.boot.veritymode": "enforcing",
+        "ro.boot.flash.locked": "1",
+        "ro.oem_unlock_supported": "0",
+        "ro.secureboot.lockstate": "locked",
+        "ro.kernel.qemu": "0",
+        "ro.boot.qemu": "0",
+        "ro.secure": "1",
+        "ro.debuggable": "0",
+        "ro.force.debuggable": "0",
+        "ro.adb.secure": "0",
+        "ro.allow.mock.location": "0",
+        "qemu.hw.mainkeys": "1"
+      },
+
+      // ------------------------------------------------------------------
+      // Hardware-feature spoofing
+      // ------------------------------------------------------------------
+      // Forces PackageManager.hasSystemFeature() to report the listed
+      // features as present. Emulators commonly lack real telephony,
+      // camera, or sensor hardware, and these feature checks are a common
+      // emulator-detection signal.
+      "hardwareFeatureSpoofEnabled": false,
+      // Feature strings to force-report as present. Merged with the
+      // module's default list. Open-ended — any valid feature string is
+      // accepted.
+      "spoofedHardwareFeatures": [
+        "android.hardware.telephony",
+        "android.hardware.camera",
+        "android.hardware.camera.any",
+        "android.hardware.camera.front",
+        "android.hardware.sensor.accelerometer",
+        "android.hardware.sensor.gyroscope",
+        "android.hardware.sensor.proximity",
+        "android.hardware.bluetooth",
+        "android.hardware.nfc",
+        "android.hardware.fingerprint",
+        "android.hardware.wifi"
+      ],
+
+      // ------------------------------------------------------------------
+      // ContentResolver.query() / call() spoofing
+      // ------------------------------------------------------------------
+      // Covers callers that read the underlying ContentProvider directly,
+      // bypassing the convenience Settings/device-ID APIs. Keyed by
+      // authority, so adding a further provider is a config change, not an
+      // engine change.
+      //
+      // The "settings" authority has special GET_*/PUT_* handling (only
+      // GET_secure/GET_global/GET_system are intercepted). Every other
+      // authority is matched on authority + arg only.
+      "contentProviderSpoofEnabled": false,
+      // Map of { authority: { key: value } }. Both the authority set and
+      // the keys within each authority are open-ended. The "settings"
+      // authority's map is merged at apply time with any Settings-derived
+      // keys from adbDevSettingsBypassEnabled / mockLocationBypassEnabled /
+      // deviceIdSpoofEnabled — those higher-level flags win on overlap.
+      "contentProviderSpoofValues": {
+        "settings": {
+          "development_settings_enabled": "0",
+          "adb_enabled": "0",
+          "mock_location": "0",
+          "android_id": "a1b2c3d4e5f6a7b8"
+        },
+        "com.google.android.gsf.gservices": {
+          "android_id": "3f9d0a2b4c5e6f71"
+        }
+      },
+
+      // ------------------------------------------------------------------
+      // Config-driven Java/Kotlin hooking
+      // ------------------------------------------------------------------
+      // Each entry hooks one overload of one Java method. Multiple
+      // overloads require multiple entries. Hooks install with retry — a
+      // class that isn't loaded yet retries up to 10× at 500 ms, on a
+      // setTimeout so app startup is never blocked.
+      //
+      // javaHooksEnabled gates the whole module, same as every other
+      // config-driven module below it (nativeHooksEnabled etc.) — you
+      // can keep javaHooks populated and just flip this off/on instead
+      // of clearing the array to pause it.
+      "javaHooksEnabled": false,
+      //
+      // Field reference (see applyJavaHook() in the script for the
+      // coercion rules):
+      //   className      Required. Fully-qualified with dots.
+      //   methodName     Required.
+      //   argTypes       Required only when the method has multiple
+      //                  overloads. Java source form for primitives
+      //                  ("boolean", "int"); JNI form for arrays ("[B").
+      //   returnType     Used only for coercion of forceReturn / void
+      //                  detection — not for overload resolution.
+      //   onCall         Optional; absent = observe only.
+      //
+      // onCall sub-keys:
+      //   logArgs      — log every argument with its declared type.
+      //   logReturn    — log the original return (no effect on void).
+      //   modifyArgs   — { "<0-based index as string>": <newValue> }.
+      //                  Values are coerced via argTypes[index]. Only use
+      //                  indices you actually declared.
+      //   nop          — skip the original. Non-void + nop without
+      //                  forceReturn returns undefined at the JNI boundary
+      //                  (usually wrong — supply forceReturn).
+      //   forceReturn  — override the return. Runs after the original
+      //                  unless nop is also set.
+      "javaHooks": [
+        // Silence a specific void method call:
+        // {
+        //   "className": "com.example.Logger",
+        //   "methodName": "writeLog",
+        //   "argTypes": ["java.lang.String"],
+        //   "returnType": "void",
+        //   "onCall": { "logArgs": true, "nop": true }
+        // },
+        //
+        // Bypass a boolean check (single-overload — argTypes omitted):
+        // {
+        //   "className": "com.example.RootChecker",
+        //   "methodName": "isDeviceRooted",
+        //   "returnType": "boolean",
+        //   "onCall": { "logReturn": true, "nop": true, "forceReturn": false }
+        // },
+        //
+        // Return a spoofed String:
+        // {
+        //   "className": "com.example.Utils",
+        //   "methodName": "getDeviceId",
+        //   "argTypes": [],
+        //   "returnType": "java.lang.String",
+        //   "onCall": {
+        //     "logReturn": true,
+        //     "forceReturn": "00000000-0000-0000-0000-000000000000"
+        //   }
+        // },
+        //
+        // Modify one argument, then force the return (multi-overload —
+        // argTypes required):
+        // {
+        //   "className": "com.example.LicenseManager",
+        //   "methodName": "isValidLicense",
+        //   "argTypes": ["java.lang.String", "int"],
+        //   "returnType": "boolean",
+        //   "onCall": {
+        //     "logArgs": true,
+        //     "logReturn": true,
+        //     "modifyArgs": { "1": 9999 },
+        //     "forceReturn": true
+        //   }
+        // }
+      ],
+
+      // ------------------------------------------------------------------
+      // Config-driven native (.so) hooking
+      // ------------------------------------------------------------------
+      // Intercepts native functions in loaded shared libraries. Two modes
+      // are selected automatically per entry:
+      //
+      //   Typed  — both argTypes and returnType present. Full type safety,
+      //            chains to the original, supports onCall.nop.
+      //   Raw    — otherwise. Pointer-sized args/return only. onCall.nop
+      //            is ignored with a warning (attach cannot skip).
+      //
+      // Each entry must supply moduleName plus exactly ONE of:
+      //   symbolName       (exported symbol, ASLR-safe — best choice)
+      //   offset           (hex string, e.g. "0x1234", ASLR-safe)
+      //   absoluteAddress  (raw pointer, NOT ASLR-safe — testing only)
+      //
+      // See applyTypedNativeHook() / applyRawNativeHook() in the script
+      // for the full type list and pairing rules.
+      "nativeHooksEnabled": false,
+      "nativeHooks": [
+        // Typed — void return, no args (observe only):
+        // {
+          // "moduleName": "libc.so",
+          // "symbolName": "srand",
+          // "argTypes": [],
+          // "returnType": "void",
+          // "onCall": { "logArgs": true }
+        // },
+        
+        // Typed — int return forced to 1 (argTypes + returnType present,
+        // so typed mode is selected automatically; the original still
+        // runs, only its return value is overridden):
+        // {
+          // "moduleName": "libtarget.so",
+          // "offset": "0x1234",
+          // "argTypes": ["int"],
+          // "returnType": "int",
+          // "onCall": { "logArgs": true, "forceReturn": 1 }
+        // },
+        
+        // Raw — no argTypes / returnType supplied, pointer-sized observe
+        // only. onCall.nop is not supported in raw mode (a warning is
+        // logged and the flag is ignored):
+        // {
+          // "moduleName": "libc.so",
+          // "symbolName": "malloc",
+          // "onCall": { "logArgs": true, "logReturn": true }
+        // }
+      ],
+
+      // ------------------------------------------------------------------
+      // Native code patching
+      // ------------------------------------------------------------------
+      // Direct instruction-byte edits at a specific address — not a function
+      // hook. The engine cannot validate that the bytes are well-formed for
+      // the target CPU; a malformed patch can corrupt execution. Original
+      // bytes are captured and restored verbatim on dispose().
+      //
+      // Same locator rules as nativeHooks. patchBytes accepts two equivalent
+      // forms:
+      //
+      //   ["1F", "20", "03", "D5"]    array of 2-char hex byte strings
+      //   "1F2003D5"                  single concatenated hex string
+      //
+      // The string form must be non-empty and even-length; a malformed
+      // string is rejected before any memory is written, so no partial
+      // patch is ever applied.
+      "nativePatchesEnabled": false,
+      "nativePatches": [
+        // NOP — array form:
+        // {
+          // "moduleName": "libtarget.so",
+          // "offset": "0x2A10",
+          // "patchBytes": ["1F", "20", "03", "D5"]
+        // },
+        
+        // MOV W0,#1 ; RET — array form:
+        // {
+          // "moduleName": "libtarget.so",
+          // "offset": "0x5678",
+          // "patchBytes": ["20", "00", "80", "52", "C0", "03", "5F", "D6"]
+        // },
+        
+        // MOV W0,#1 ; RET — string form (equivalent to the array above):
+        // {
+          // "moduleName": "libtarget.so",
+          // "offset": "0x5678",
+          // "patchBytes": "20008052C0035FD6"
+        // }
+      ],
+      // ------------------------------------------------------------------
+      // RegisterNatives discovery / logging
+      // ------------------------------------------------------------------
+      // Hooks JNIEnv::RegisterNatives inside libart.so and logs, for every
+      // native method registered at runtime, its declaring class, method
+      // name, JNI signature, and the native function pointer's owning
+      // module + offset. Recovers the class↔native-function mapping even
+      // when:
+      //   - the native library's own symbol table is stripped (common
+      //     under packers / anti-tamper protections), so readelf / objdump
+      //     / IDA can't name the function directly, and
+      //   - the app registers natives explicitly via RegisterNatives()
+      //     rather than relying on the Java_pkg_Class_method JNI naming
+      //     convention, so there is no static name to look up at all.
+      //
+      // Complements nativeHooksEnabled / nativePatchesEnabled: this module
+      // discovers the (module + offset) targets those two require. Point
+      // them at whatever this logs.
+      //
+      // Discovery only — no hooking or modifying of native registrations.
+      // Native methods registered before init() completes (very early in
+      // process startup) may be missed.
+      "registerNativesLogEnabled": false,
+      // Class names to restrict logging to. Match the exact form
+      // printed by the module's ">> <className>" log line (typically
+      // dotted form, e.g. "com.example.app.NativeBridge"). An empty
+      // array — the default — logs every RegisterNatives call
+      // process-wide, including system and Play Services libraries,
+      // which is noisy. Supply one or more names to narrow the output
+      // to the target app's classes.
+      "registerNativesLogClassFilter": [],
+      // Optional manual override for locating RegisterNatives in libart.so.
+      // The default heuristic scans libart.so's exported symbols for names
+      // matching "art" + "JNI" + "RegisterNatives" (excluding CheckJNI).
+      // On a build with stripped symbols this finds nothing, in which case
+      // set symbolName or offset here from an AOSP debug build's symbol
+      // table for the matching ART / API version, or from your own
+      // native-layer analysis.
+      //
+      // When the heuristic finds more than one candidate, only the first
+      // is hooked by default; every candidate found is logged so you can
+      // pin the correct one via symbolName if the default pick is wrong
+      // for this device's ART build.
+      //
+      // Closed key set — only symbolName and offset are accepted.
+      // symbolName and offset are mutually exclusive: set one, leave the
+      // other empty. Both empty means "use the heuristic".
+      "registerNativesLogLocator": {
+        "symbolName": "",
+        "offset": ""
+      }
+    }
+  }
+}

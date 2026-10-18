@@ -1,0 +1,50 @@
+# --- OS junk ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Node / npm ---
+# Only relevant if you set up a local frida-compile project to build your
+# own agent.js from engine.js (see docs/installation.md). The repo's own
+# shipped engine.js / agent.js / config.json are plain project files, not
+# build output, and are NOT covered by anything below.
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+.npm/
+
+# --- Logs ---
+*.log
+logs/
+adb-logcat.txt
+
+# --- Env / secrets ---
+.env
+.env.*
+
+# --- Target APKs / test artifacts dropped alongside the repo while working ---
+*.apk
+*.ipa
+*.dex
+target-src/
+rebuilt.apk
+
+# --- Misc temp ---
+*.tmp
+*.bak
+*.orig
