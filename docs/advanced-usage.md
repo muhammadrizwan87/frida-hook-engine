@@ -210,6 +210,33 @@ you explicitly want to hook every overload with identical behavior.
 JNI primitive forms (`"Z"`, `"I"`) are not accepted in `argTypes` — use
 the word forms.
 
+### rawSignature — JNI/smali descriptor shortcut
+
+Instead of declaring `className`, `methodName`, `argTypes`, and `returnType`
+individually, supply a single `rawSignature` string exactly as shown by jadx
+or MT Manager:
+
+```jsonc
+"javaHooksEnabled": true,
+"javaHooks": [
+  {
+    "rawSignature": "Lcom/example/Utils;->getDeviceId()Ljava/lang/String;",
+    "onCall": { "logReturn": true, "forceReturn": "00000000-0000-0000-0000-000000000000" }
+  },
+  {
+    "rawSignature": "Lcom/example/Foo;-><init>(Ljava/lang/String;)V",
+    "onCall": { "logArgs": true }
+  }
+]
+```
+
+- Slash-separated class names are converted to dotted form (`Lcom/example/Foo;` → `com.example.Foo`).
+- JNI primitive letters map to Java word forms (`Z` → `boolean`, `I` → `int`, etc.).
+- `<init>` maps to `$init` (constructor); `<clinit>` maps to `classInitializer` (static initializer).
+- `returnType` is parsed automatically from the descriptor — you do not need to repeat it unless you want to override the parsed value.
+- Any of `className`, `methodName`, `argTypes`, `returnType` given explicitly on the same entry wins over the parsed value for that field.
+- `onCall` and any other keys pass through untouched.
+
 ### Primitive return types
 
 `returnType` is used only to coerce `forceReturn` and to detect void.

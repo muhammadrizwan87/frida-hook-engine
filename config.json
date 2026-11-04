@@ -373,8 +373,15 @@
       //
       // Field reference (see applyJavaHook() in the script for the
       // coercion rules):
-      //   className      Required. Fully-qualified with dots.
-      //   methodName     Required.
+      //   className      Required unless rawSignature is given. Fully-
+      //                  qualified with dots.
+      //   methodName     Required unless rawSignature is given. Exact
+      //                  name.
+      //   rawSignature   Optional alternative to className/methodName/
+      //                  argTypes/returnType: raw JNI/smali descriptor,
+      //                  e.g. "Lcom/example/Foo;->bar(Ljava/lang/String;I)Z".
+      //                  Parsed once at config-load time; explicit fields
+      //                  win over parsed values for the same key.
       //   argTypes       Required only when the method has multiple
       //                  overloads. Java source form for primitives
       //                  ("boolean", "int"); JNI form for arrays ("[B").
@@ -436,7 +443,19 @@
         //     "modifyArgs": { "1": 9999 },
         //     "forceReturn": true
         //   }
-        // }
+        // },
+        //
+        // rawSignature — JNI/smali descriptor instead of individual fields:
+        // {
+        //   "rawSignature": "Lcom/example/Utils;->getDeviceId()Ljava/lang/String;",
+        //   "onCall": { "logReturn": true, "forceReturn": "00000000-0000-0000-0000-000000000000" }
+        // },
+        //
+        // rawSignature with constructor (<init> maps to $init):
+        // {
+        //   "rawSignature": "Lcom/example/Foo;-><init>(Ljava/lang/String;)V",
+        //   "onCall": { "logArgs": true }
+        // },
       ],
 
       // ------------------------------------------------------------------

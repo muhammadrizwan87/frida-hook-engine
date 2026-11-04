@@ -107,7 +107,7 @@ source-level defaults; wrong-typed parameters are logged and ignored.
 | `systemPropertySpoofEnabled` | boolean | `false` | System-property spoofing |
 | `hardwareFeatureSpoofEnabled` | boolean | `false` | Hardware-feature spoofing |
 | `contentProviderSpoofEnabled` | boolean | `false` | ContentProvider spoofing |
-| `javaHooksEnabled` | boolean | `false` | Config-driven Java hooking |
+| `javaHooksEnabled` | boolean | `false` | Config-driven Java hooking (`rawSignature` supported per entry) |
 | `nativeHooksEnabled` | boolean | `false` | Native hooking |
 | `nativePatchesEnabled` | boolean | `false` | Native patching |
 | `registerNativesLogEnabled` | boolean | `false` | RegisterNatives discovery/logging |
@@ -193,7 +193,10 @@ coerces — it is logged and the source default is used.
 `array<object>` resolvers (used by `nativeHooks`, `nativePatches`, and
 `javaHooks`) validate array-ness at the resolver level and defer
 per-entry validation to the apply function. A malformed entry is
-rejected individually without affecting other entries.
+rejected individually without affecting other entries. A `rawSignature`
+field on a `javaHooks` entry is parsed once at config-load time; a
+malformed descriptor is logged and that entry is left as-is to fail at
+apply time, without affecting other entries.
 
 ---
 

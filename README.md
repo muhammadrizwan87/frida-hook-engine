@@ -209,12 +209,12 @@ mode, pass parameters via `rpc.exports.init()` from a live controller.
 | `systemPropertySpoofEnabled` | Hook `SystemProperties.get()` for raw `ro.*` / `qemu.*` reads |
 | `hardwareFeatureSpoofEnabled` | Force `hasSystemFeature()` to report listed features |
 | `contentProviderSpoofEnabled` | Intercept direct `ContentResolver.query()` / `call()` |
-| `javaHooksEnabled` | Enable config-driven Java / Kotlin method hooks |
+| `javaHooksEnabled` | Enable config-driven Java / Kotlin method hooks (`rawSignature` supported) |
 | `nativeHooksEnabled` | Hook native (.so) functions |
 | `nativePatchesEnabled` | Patch raw instruction bytes at an address |
 | `registerNativesLogEnabled` | Log every `RegisterNatives` call at runtime |
 
-Per-module details: [Modules](docs/modules.md).
+Per-module details: [Modules](docs/modules.md). Java hook entries accept a `rawSignature` field (JNI/smali descriptor); see [Modules → Config-Driven Java Hooking](docs/modules.md).
 
 ---
 

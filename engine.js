@@ -300,14 +300,38 @@ let javaHooksEnabled = false;
  * never blocked.
  *
  * Schema (per entry):
- *   className    REQUIRED — fully-qualified Java name with dots,
- *                e.g. "com.example.Foo" (never JNI form "Lcom/...").
- *   methodName   REQUIRED — exact method name as declared.
+ *   className    REQUIRED unless rawSignature is given — fully-
+ *                qualified Java name with dots, e.g. "com.example.Foo"
+ *                (never JNI form "Lcom/...").
+ *   methodName   REQUIRED unless rawSignature is given — exact method
+ *                name as declared. Use "$init" for a constructor and
+ *                "classInitializer" for a static initializer (Frida's
+ *                own names for <init>/<clinit>; rawSignature maps
+ *                these automatically).
+ *   rawSignature OPTIONAL — alternative to supplying className/
+ *                methodName/argTypes/returnType individually: a raw
+ *                JNI/smali method descriptor exactly as shown by
+ *                jadx/MT Manager, e.g.
+ *                "Lcom/example/Foo;->bar(Ljava/lang/String;I)Z".
+ *                Parsed once at config-load time into the four fields
+ *                above — slash->dot class names, JNI primitive
+ *                letters mapped to their Java word form, "<init>"/
+ *                "<clinit>" mapped to "$init"/"classInitializer". Any
+ *                of those four fields given explicitly on the same
+ *                entry wins over the value parsed from rawSignature
+ *                for that field; onCall is unaffected either way.
  *   argTypes     OPTIONAL — required when the method has multiple
- *                overloads. Java source form for primitives
- *                ("boolean", "int", "long"); JNI form for arrays
- *                ("[B", "[Ljava.lang.String;"). JNI primitive forms
- *                ("Z", "I") are NOT accepted here — use the word forms.
+ *                overloads. Omitting the key entirely hooks every
+ *                overload with one implementation (warned about when
+ *                more than one exists); passing [] explicitly instead
+ *                targets that method's own zero-arg overload — the
+ *                two are not treated the same, which matters for
+ *                constructors in particular (a class commonly has
+ *                both a zero-arg and a parameterized one). Java
+ *                source form for primitives ("boolean", "int",
+ *                "long"); JNI form for arrays ("[B",
+ *                "[Ljava.lang.String;"). JNI primitive forms ("Z",
+ *                "I") are NOT accepted here — use the word forms.
  *   returnType   OPTIONAL — used only to coerce forceReturn and to
  *                detect void; not used by overload resolution.
  *                Accepts both word form ("void", "int") and JNI
@@ -329,6 +353,11 @@ let javaHooksEnabled = false;
  *   modified args.
  *   forceReturn without nop → original runs (side effects happen);
  *   only the return value is overridden.
+ *   nop on a constructor ($init) skips the original constructor body
+ *   entirely — including any super() call it would have made — which
+ *   can leave the object only partially initialized; prefer
+ *   forceReturn-free observation or modifyArgs on constructors unless
+ *   you specifically intend to replace construction.
  *
  * Examples (edit and place inside the array literal):
  *
@@ -353,7 +382,19 @@ let javaHooksEnabled = false;
  *   { className: 'com.example.LicenseManager', methodName: 'isValidLicense',
  *     argTypes: ['java.lang.String', 'int'], returnType: 'boolean',
  *     onCall: { logArgs: true, logReturn: true,
- *               modifyArgs: { '1': 9999 }, forceReturn: true } }
+ *               modifyArgs: { '1': 9999 }, forceReturn: true } },
+ *
+ *   // Same hook as above, pasted straight from jadx's smali view
+ *   // instead of hand-translated — equivalent to the entry above:
+ *   { rawSignature: 'Lcom/example/LicenseManager;->isValidLicense(Ljava/lang/String;I)Z',
+ *     onCall: { logArgs: true, logReturn: true,
+ *               modifyArgs: { '1': 9999 }, forceReturn: true } },
+ *
+ *   // Log every call to a specific constructor (zero-arg only — note
+ *   // argTypes: [] below targets just that overload, not every
+ *   // constructor this class has):
+ *   { rawSignature: 'Lcom/example/App;-><init>()V',
+ *     onCall: { logArgs: true } }
  */
 let defaultJavaHooks = [];
 
@@ -748,23 +789,32 @@ function coerceValueForType(type, rawValue) {
  * overload, which silently produces wrong values for any overload
  * whose real return type differs. className is passed through purely
  * for a clearer warning message.
+ *
+ * argTypesProvided distinguishes "argTypes key omitted entirely" from
+ * "argTypes: [] supplied explicitly" — both produce an empty array,
+ * but only the former is ambiguous. An explicit [] targets that
+ * method's zero-arg overload specifically via .overload() with no
+ * arguments, which matters for constructors ($init) in particular:
+ * a class commonly has both a zero-arg and a parameterized
+ * constructor, so collapsing the two cases would silently hook every
+ * constructor overload instead of just the zero-arg one.
  */
-function resolveOverload(className, target, methodName, argTypes) {
+function resolveOverload(className, target, methodName, argTypes, argTypesProvided) {
   const methodGroup = target[methodName];
   if (!methodGroup) {
     throw new Error(`Method not found: ${methodName}`);
   }
-  if (!argTypes || argTypes.length === 0) {
-    const overloadCount = Array.isArray(methodGroup.overloads) ? methodGroup.overloads.length : 1;
-    if (overloadCount > 1) {
-      logW(`[resolveOverload] ${className}.${methodName} has ${overloadCount} overloads but argTypes ` +
-           `was omitted — hooking ALL of them with one implementation and one declared returnType. ` +
-           `If the overloads don't all share that return type, forceReturn/modifyArgs coercion will ` +
-           `be wrong for the mismatched ones. Supply argTypes to target a single overload.`);
-    }
-    return methodGroup;
+  if (argTypesProvided) {
+    return methodGroup.overload(...argTypes);
   }
-  return methodGroup.overload(...argTypes);
+  const overloadCount = Array.isArray(methodGroup.overloads) ? methodGroup.overloads.length : 1;
+  if (overloadCount > 1) {
+    logW(`[resolveOverload] ${className}.${methodName} has ${overloadCount} overloads but argTypes ` +
+         `was omitted — hooking ALL of them with one implementation and one declared returnType. ` +
+         `If the overloads don't all share that return type, forceReturn/modifyArgs coercion will ` +
+         `be wrong for the mismatched ones. Supply argTypes to target a single overload.`);
+  }
+  return methodGroup;
 }
 
 /**
@@ -776,10 +826,12 @@ function resolveOverload(className, target, methodName, argTypes) {
  * implementation for later reversal.
  */
 function applyJavaHook(hookConfig) {
-  const { className, methodName, argTypes = [], returnType, onCall = {} } = hookConfig;
+  const { className, methodName, returnType, onCall = {} } = hookConfig;
+  const argTypesProvided = Object.prototype.hasOwnProperty.call(hookConfig, 'argTypes');
+  const argTypes = argTypesProvided ? hookConfig.argTypes : [];
 
   const target = Java.use(className);
-  const boundMethod = resolveOverload(className, target, methodName, argTypes);
+  const boundMethod = resolveOverload(className, target, methodName, argTypes, argTypesProvided);
   const voidReturn = isVoidType(returnType);
   const originalImpl = boundMethod.implementation;
 
@@ -2708,6 +2760,128 @@ function resolveJavaHooksArray(parameters, currentDefault) {
     return currentDefault;
   }
   return value;
+}
+
+// --- rawSignature parsing for javaHooks entries (see schema doc above defaultJavaHooks) ---
+
+const JNI_PRIMITIVE_TO_JAVA = {
+  Z: 'boolean', B: 'byte', C: 'char', S: 'short',
+  I: 'int', J: 'long', F: 'float', D: 'double', V: 'void'
+};
+
+// JNI/smali method names for a constructor and a static initializer
+// don't match Frida's own property names for them — Frida exposes
+// these as "$init" and "classInitializer" respectively, so that's
+// what methodName must be for the engine's existing generic
+// target[methodName] access (in resolveOverload/applyJavaHook) to
+// find them. No other special-casing is needed for either: Frida
+// treats both as ordinary hookable method groups.
+const JNI_SPECIAL_METHOD_NAMES = {
+  '<init>': '$init',
+  '<clinit>': 'classInitializer'
+};
+
+/**
+ * Converts one isolated JNI type descriptor (as produced by
+ * tokenizeJniTypeDescriptors below) into the form this engine's
+ * argTypes/returnType fields already accept: Java source word for a
+ * bare primitive, dotted class name for a bare object type, and JNI
+ * bracket form for an array — with the array's inner class name
+ * dotted rather than slashed, matching the convention documented for
+ * argTypes/returnType above (e.g. "[Ljava.lang.String;", not the raw
+ * JNI "[Ljava/lang/String;"). A primitive array keeps its JNI letter
+ * unchanged (e.g. "[I"), since that's already the accepted form.
+ */
+function jniTypeToEngineType(descriptor) {
+  let depth = 0;
+  while (descriptor[depth] === '[') depth++;
+  const base = descriptor.slice(depth);
+
+  if (base.length === 1 && JNI_PRIMITIVE_TO_JAVA[base]) {
+    return '['.repeat(depth) + (depth > 0 ? base : JNI_PRIMITIVE_TO_JAVA[base]);
+  }
+  if (base[0] === 'L' && base.endsWith(';')) {
+    const dotted = base.slice(1, -1).replace(/\//g, '.');
+    return depth > 0 ? ('['.repeat(depth) + 'L' + dotted + ';') : dotted;
+  }
+  throw new Error(`Unrecognized type descriptor: ${descriptor}`);
+}
+
+/**
+ * Splits a JNI method-descriptor argument blob (the delimiter-less
+ * run of type descriptors between the parentheses, e.g.
+ * "Ljava/lang/String;I[B") into its individual descriptors.
+ */
+function tokenizeJniTypeDescriptors(blob) {
+  const tokens = [];
+  let i = 0;
+  while (i < blob.length) {
+    const start = i;
+    while (blob[i] === '[') i++;
+    if (blob[i] === 'L') {
+      const semi = blob.indexOf(';', i);
+      if (semi === -1) {
+        throw new Error(`Unterminated object type in argument list: ${blob}`);
+      }
+      i = semi + 1;
+    } else if (JNI_PRIMITIVE_TO_JAVA[blob[i]]) {
+      i++;
+    } else {
+      throw new Error(`Unrecognized type descriptor at position ${start} in argument list: ${blob}`);
+    }
+    tokens.push(blob.slice(start, i));
+  }
+  return tokens;
+}
+
+/**
+ * Parses a raw JNI/smali method descriptor — as copied verbatim from
+ * jadx's smali view or MT Manager, e.g.
+ * "Lcom/example/Foo;->bar(Ljava/lang/String;I)Z" — into the
+ * {className, methodName, argTypes, returnType} shape applyJavaHook()
+ * already expects. See JNI_SPECIAL_METHOD_NAMES above for the
+ * <init>/<clinit> name mapping.
+ */
+function parseRawSignature(rawSignature) {
+  const match = /^L([^;]+);->([^(]+)\(([^)]*)\)(.+)$/.exec(rawSignature);
+  if (!match) {
+    throw new Error(`Malformed rawSignature (expected "Lpkg/Class;->method(args)ret"): ${rawSignature}`);
+  }
+  const [, classPart, rawMethodName, argsBlob, returnDescriptor] = match;
+
+  return {
+    className: classPart.replace(/\//g, '.'),
+    methodName: JNI_SPECIAL_METHOD_NAMES[rawMethodName] || rawMethodName,
+    argTypes: tokenizeJniTypeDescriptors(argsBlob).map(jniTypeToEngineType),
+    returnType: jniTypeToEngineType(returnDescriptor)
+  };
+}
+
+/**
+ * Normalizes javaHooks entries that use rawSignature into the
+ * className/methodName/argTypes/returnType fields applyJavaHook()
+ * already expects, sparing config authors the manual slash->dot and
+ * primitive-letter translation. Runs once here, at config-resolve
+ * time — applyJavaHook()/resolveOverload() never see rawSignature and
+ * are not otherwise modified by this. Any of those four fields given
+ * explicitly on the same entry wins over the value parsed from
+ * rawSignature for that field (so a mixed entry, or a config that
+ * doesn't use rawSignature at all, is unaffected); onCall and any
+ * other keys pass through untouched.
+ */
+function normalizeJavaHooksArray(hooks) {
+  if (!Array.isArray(hooks)) return hooks;
+  return hooks.map((entry) => {
+    if (!entry || typeof entry !== 'object' || !entry.rawSignature) {
+      return entry;
+    }
+    try {
+      return { ...parseRawSignature(entry.rawSignature), ...entry };
+    } catch (e) {
+      logE(`[normalizeJavaHooksArray] ${e.message} — leaving this entry as-is; it will fail at apply time`);
+      return entry;
+    }
+  });
 }
 
 /**
@@ -5986,7 +6160,7 @@ rpc.exports = {
     contentProviderSpoofEnabled = resolveBooleanFlag(parameters, 'contentProviderSpoofEnabled', contentProviderSpoofEnabled);
     contentProviderSpoofValues = resolveNestedStringMap(parameters, 'contentProviderSpoofValues', contentProviderSpoofValues);
     javaHooksEnabled = resolveBooleanFlag(parameters, 'javaHooksEnabled', javaHooksEnabled);
-    defaultJavaHooks = resolveJavaHooksArray(parameters, defaultJavaHooks);
+    defaultJavaHooks = normalizeJavaHooksArray(resolveJavaHooksArray(parameters, defaultJavaHooks));
     nativeHooksEnabled = resolveBooleanFlag(parameters, 'nativeHooksEnabled', nativeHooksEnabled);
     nativeHooks = resolveArrayValue(parameters, 'nativeHooks', nativeHooks);
     nativePatchesEnabled = resolveBooleanFlag(parameters, 'nativePatchesEnabled', nativePatchesEnabled);

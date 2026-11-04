@@ -803,8 +803,9 @@ is `false`.
 
 | Field | Required | Notes |
 |---|---|---|
-| `className` | yes | Fully qualified with dots |
-| `methodName` | yes | Exact name |
+| `className` | yes unless `rawSignature` is given | Fully qualified with dots |
+| `methodName` | yes unless `rawSignature` is given | Exact name |
+| `rawSignature` | no | Optional JNI/smali descriptor, e.g. `"Lcom/example/Foo;->bar(Ljava/lang/String;I)Z"`. Parsed at config-load into `className`/`methodName`/`argTypes`/`returnType`; explicit fields win over parsed values for the same key. |
 | `argTypes` | recommended | Selects a specific overload. Java source form for primitives (`"boolean"`, `"int"`); JNI form for arrays (`"[B"`, `"[Ljava.lang.String;"`). Omit only for single-overload methods — omitting against a multi-overload method hooks all of them with one implementation and one declared `returnType`, which the engine warns about |
 | `returnType` | no | Used only to coerce `forceReturn` and to detect void — not for overload resolution |
 | `onCall` | no | Behavior block; absent = observe only |
@@ -872,6 +873,25 @@ loaded yet when `init()` runs. Each entry retries up to 10 times at
   }
 ]
 ```
+
+### rawSignature — JNI/smali descriptor shortcut
+
+Instead of declaring `className`, `methodName`, `argTypes`, and `returnType`
+individually, supply a single `rawSignature` string exactly as shown by jadx
+or MT Manager:
+
+```jsonc
+{
+  "rawSignature": "Lcom/example/Utils;->getDeviceId()Ljava/lang/String;",
+  "onCall": { "logReturn": true, "forceReturn": "00000000-0000-0000-0000-000000000000" }
+}
+```
+
+- Slash-separated class names are converted to dotted form (`Lcom/example/Foo;` → `com.example.Foo`).
+- JNI primitive letters map to Java word forms (`Z` → `boolean`, `I` → `int`, etc.).
+- `<init>` maps to `$init` (constructor); `<clinit>` maps to `classInitializer` (static initializer).
+- `returnType` is parsed automatically from the descriptor — you do not need to repeat it unless you want to override the parsed value.
+- `onCall` and any other keys pass through untouched.
 
 ### Native (.so) Hooking
 
