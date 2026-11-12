@@ -1,6 +1,6 @@
 # Modules
 
-21 modules, grouped by function. Every module is off by default. To
+22 modules, grouped by function. Every module is off by default. To
 enable one, set its flag to `true` in `config.json` (Gadget Script mode)
 or edit the source-level default in `engine.js` (CLI attach / spawn).
 
@@ -1050,6 +1050,70 @@ be missed.
   "com.example.app.Codec"
 ]
 ```
+
+## Camera Input Mock
+
+`cameraMockEnabled` — mocks camera input at two layers: Layer 1 redirects
+`ACTION_IMAGE_CAPTURE` / `ACTION_IMAGE_CAPTURE_SECURE` intents through an
+image picker and delivers the picked image back through the caller's exact
+contract (`EXTRA_OUTPUT` file write or inline `"data"` Bitmap thumbnail).
+Layer 2 substitutes the `Image` returned by
+`ImageReader.acquireNextImage()` / `acquireLatestImage()` for still-capture
+Camera2 readers, leaving the real capture pipeline untouched.
+
+**Hooks:**
+
+- **Java layer:** `Activity.startActivityForResult`,
+  `Instrumentation.execStartActivity`, `Activity.dispatchActivityResult`,
+  `PackageManager.hasSystemFeature` / `resolveActivity` /
+  `queryIntentActivities` (Layer 1).
+- **Java layer:** `ImageReader.newInstance`,
+  `ImageReader.acquireNextImage` / `acquireLatestImage`,
+  `Image.getWidth` / `getHeight` / `getFormat` / `getTimestamp`,
+  `ImageWriter.dequeueInputImage` / `queueInputImage` (Layer 2).
+
+**Config:** Gated by `cameraMockEnabled`. Value object `cameraMockValues`
+accepts `layer1Enabled`, `layer2Enabled`, `jpegSource`, `toastOnReady`,
+`toastReadyText`, `toastOnFailure`, `toastFailText`.
+
+**Enable when:** the target app consumes camera input through the system
+picker contract or its own Camera2 still-capture pipeline, and you want to
+substitute a mock image instead of a real capture.
+
+**Pairing:** Independent of every other module. No value contributions to
+or from `contentProviderSpoofEnabled` or any other module.
+
+**Limits:** JPEG still-capture only — no HEIC, RAW_SENSOR, YUV analysis
+streams, or video capture. Layer 2 requires real camera hardware (the module
+does not virtualize `CameraDevice`/`CameraCaptureSession`). Layer 1 intent
+redirect works without camera hardware — it delivers through the system picker.
+EXIF metadata is not preserved after re-encoding. Front and back cameras share
+the same mock source. Fail-open: on any substitution error the real image is
+returned.
+
+```jsonc
+"cameraMockEnabled": false,
+"cameraMockValues": {
+  "layer1Enabled": true,
+  "layer2Enabled": true,
+  "jpegSource": "placeholder",
+  "toastOnReady": true,
+  "toastReadyText": "cam-mock: ready",
+  "toastOnFailure": true,
+  "toastFailText": "cam-mock: NOT READY - real image will be captured"
+}
+```
+
+### Usage note — wait for the toast before capture
+
+Layer 2 substitutes the captured still **after** the shutter click, on the original frame the camera surface already produced. The substitute is not live-preview — it is the final JPEG handed back by `ImageReader.acquireNextImage()`/`acquireLatestImage()`.
+
+Because of this, the engine shows a toast:
+
+- **`toastReadyText`** (`"cam-mock: ready"`): Layer 2 is armed and will substitute the next still capture. Wait for this toast **before** you press capture.
+- **`toastFailText`** (`"cam-mock: NOT READY - real image will be captured"`): Layer 2 could not arm (no camera hardware, reader mismatch, or source unavailable). If you capture now, the **original real image** is uploaded — no substitution happens.
+
+**Rule:** capture only after `toastReadyText`. If you see `toastFailText`, abort and fix the source/config first.
 
 ---
 

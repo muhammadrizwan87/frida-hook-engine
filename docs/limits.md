@@ -171,6 +171,17 @@ affect other entries. This is a deliberate fail-safe-per-item design.
 | Target resolution | A `symbolName` or `offset` locator is ASLR-safe; `absoluteAddress` is not. On each app launch, `absoluteAddress` values from a prior session will point at unrelated memory |
 | Ordering | Both modules install before `sslPinningBypass`. Reordering risks overwriting the SSL module's `Interceptor.attach()` trampoline — see [Architecture](architecture.md) |
 
+### Camera input mock
+
+| Boundary | Detail |
+|---|---|
+| Coverage | JPEG still-capture only. HEIC, RAW_SENSOR/RAW10/RAW12 formats, YUV analysis streams, and video capture (`MediaRecorder`, `ACTION_VIDEO_CAPTURE`) are out of scope |
+| Camera hardware | Layer 2 requires a real, running `CameraDevice`/`CameraCaptureSession` sensor pipeline; the module does not virtualize camera hardware for camera-less emulation. Layer 1 intent redirect works without camera hardware |
+| EXIF | EXIF metadata is not preserved in the synthesized JPEG — no GPS, ISO, lens, or maker-note fields survive re-encoding |
+| Source image aspect | When the source image's aspect ratio differs from the target reader's, the result is center-cropped, discarding edge content from the source |
+| Image reuse | Front and back cameras share the same synthesized source image — a simultaneous front/back cross-comparison check would observe identical content |
+| Fail-safe | On any substitution error the real image is returned (fail-open) |
+
 ### Frida detection
 
 The engine does not include a Frida-detection bypass. It assumes the

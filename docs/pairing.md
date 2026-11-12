@@ -36,6 +36,7 @@ not. Enable each module only when the target's own behavior calls for it.
 | `geoRestrictionBypassEnabled` + `localeSpoofEnabled` | Independent. Geo spoofs carrier and network identity; locale spoofs displayed language, region, and formatting. Enable each only when the target reads the corresponding surface. |
 | `buildPropSpoofEnabled` + `systemPropertySpoofEnabled` | Independent. The two cover different reads — see [Build-Prop and System-Property](#build-prop-and-system-property) below. |
 | `suspiciousPackageSpoofEnabled` + `installedPackageSpoofEnabled` | Independent, and inverses. The first removes packages from the target's view; the second adds them. They can run together, but a package listed in both is a configuration mistake. |
+| `cameraMockEnabled` | Independent of every other module — no dependencies, no value contributions to `contentProviderSpoofEnabled` or any other module. Layer 1 intent redirect and Layer 2 Camera2 substitution operate entirely on their own hook targets. |
 
 ---
 

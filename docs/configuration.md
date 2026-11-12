@@ -111,6 +111,7 @@ source-level defaults; wrong-typed parameters are logged and ignored.
 | `nativeHooksEnabled` | boolean | `false` | Native hooking |
 | `nativePatchesEnabled` | boolean | `false` | Native patching |
 | `registerNativesLogEnabled` | boolean | `false` | RegisterNatives discovery/logging |
+| `cameraMockEnabled` | boolean | `false` | Mock camera input (Layer 1 intent redirect + Layer 2 Camera2 substitution) |
 
 ### Value objects
 
@@ -131,6 +132,9 @@ source-level defaults; wrong-typed parameters are logged and ignored.
 | `nativePatches` | array\<object\> | `[]` | `nativePatchesEnabled` |
 | `registerNativesLogClassFilter` | array\<string\> | `[]` | `registerNativesLogEnabled` |
 | `registerNativesLogLocator` | object | `{ symbolName: "", offset: "" }` | `registerNativesLogEnabled` |
+| `cameraMockValues` | object | see [Modules](modules.md) | `cameraMockEnabled` |
+
+**`cameraMockValues` toast fields:** `toastOnReady` / `toastReadyText` gate whether the ready toast shows before capture; `toastOnFailure` / `toastFailText` gate the failure toast. Wait for the ready toast before pressing capture — see [Usage note](docs/modules.md#usage-note--wait-for-the-toast-before-capture).
 
 ---
 
@@ -141,7 +145,7 @@ shape it uses.
 
 | Schema | Modules | Shape |
 |---|---|---|
-| **Closed-key flat map** | `geoSpoofValues`, `localeSpoofValues`, `buildPropSpoofValues`, `deviceIdSpoofValues`, `registerNativesLogLocator` | `{ key: string }` — fixed key set |
+| **Closed-key flat map** | `geoSpoofValues`, `localeSpoofValues`, `buildPropSpoofValues`, `deviceIdSpoofValues`, `registerNativesLogLocator`, `cameraMockValues` | `{ key: string }` — fixed key set |
 | **Open-key flat map** | `systemPropertySpoofValues` | `{ key: string }` — any key accepted |
 | **Nested map** | `contentProviderSpoofValues`, `installedPackageSpoofValues` | `{ outer: { inner: string } }` |
 | **String array** | `suspiciousPackagesCustom`, `spoofedHardwareFeatures` | `[string, ...]` |

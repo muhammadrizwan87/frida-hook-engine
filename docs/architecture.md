@@ -104,7 +104,7 @@ its trampolines do not land inside any patched range.
 ## Adding a module
 
 The conventions below apply when extending the engine. They are the same
-conventions the existing 21 modules follow.
+conventions the existing 22 modules follow.
 
 **Register a flag.** Declare a module-level `let` variable at the top of
 `engine.js`, with a JSDoc comment describing its purpose and its

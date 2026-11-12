@@ -1,13 +1,13 @@
 # Frida Hook Engine
 
 > A configuration-driven instrumentation engine for Frida on Android.   
-> 21 hook modules behind one JSON config — SSL pinning bypass, device   
+> 22 hook modules behind one JSON config — SSL pinning bypass, device   
 > spoofing, package hiding, native hooking, and more.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-lightgrey.svg)](LICENSE)
 [![Frida](https://img.shields.io/badge/Frida-17.x-green.svg)](https://frida.re)
 [![Platform](https://img.shields.io/badge/platform-Android%20ARM64-orange.svg)]()
-[![Modules](https://img.shields.io/badge/modules-21-blueviolet.svg)]()
+[![Modules](https://img.shields.io/badge/modules-22-blueviolet.svg)]()
 
 ---
 
@@ -45,7 +45,7 @@ that mode. For Gadget Listen mode, pass parameters via
 
 ## Overview
 
-Frida Hook Engine is a single-file instrumentation script bundling 21
+Frida Hook Engine is a single-file instrumentation script bundling 22
 independent modules behind one configurable surface. Every module is
 toggled by a boolean; every value is tunable by a JSON edit.
 
@@ -95,7 +95,7 @@ Full walkthrough: [Installation → Path A](docs/installation.md#path-a--contain
    option among several. Then install.
 
 32-bit target? Use `lib/armeabi-v7a/`. The SSL native layer requires
-ARM64; the other 20 modules work on any ABI.
+ARM64; the other 21 modules work on any ABI.
 
 Full walkthrough: [Installation → Path B](docs/installation.md#path-b--repack-the-apk).
 
@@ -188,7 +188,7 @@ mode, pass parameters via `rpc.exports.init()` from a live controller.
 
 ## Modules
 
-21 modules. Every flag is optional; every module is off by default.
+22 modules. Every flag is optional; every module is off by default.
 
 | Flag | Purpose |
 |---|---|
@@ -213,6 +213,7 @@ mode, pass parameters via `rpc.exports.init()` from a live controller.
 | `nativeHooksEnabled` | Hook native (.so) functions |
 | `nativePatchesEnabled` | Patch raw instruction bytes at an address |
 | `registerNativesLogEnabled` | Log every `RegisterNatives` call at runtime |
+| `cameraMockEnabled` | Mock camera input — Layer 1 intent capture redirect and Layer 2 Camera2 still-capture substitution (`cameraMockValues`) |
 
 Per-module details: [Modules](docs/modules.md). Java hook entries accept a `rawSignature` field (JNI/smali descriptor); see [Modules → Config-Driven Java Hooking](docs/modules.md).
 

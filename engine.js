@@ -530,6 +530,28 @@ let registerNativesLogClassFilter = [];
  */
 let registerNativesLogLocator = { symbolName: "", offset: "" };
 
+/** Enables the camera-input mock module — Layer 1 (intent-based capture redirect) and Layer 2 (Camera2 in-process still-capture substitution). Overridden by parameters.cameraMockEnabled. */
+let cameraMockEnabled = false;
+
+/** Configuration values for the camera-mock module. Overridden per-key by parameters.cameraMockValues. See resolveTypedMap() for merge semantics. */
+let cameraMockValues = {
+  layer1Enabled: true,
+  layer2Enabled: true,
+  // Substitution source image. Accepted forms (see normalizeSourceUri()):
+  //   'placeholder'                       -> synthesized placeholder JPEG (default)
+  //   '/sdcard/Pictures/mock.jpg'          -> plain absolute file path (no prefix needed;
+  //                                           normalizeSourceUri() adds 'file://' itself)
+  //   'file:///sdcard/Pictures/mock.jpg'   -> explicit file:// URI (also accepted as-is)
+  //   'content://media/external/images/media/123' -> content:// URI (also accepted as-is)
+  // A bare path MUST start with '/' (absolute). Relative paths (e.g. 'mock.jpg') are
+  // rejected at runtime with a warning - there is no implied base directory.
+  jpegSource: 'placeholder',
+  toastOnReady: true,
+  toastReadyText: 'cam-mock: ready',
+  toastOnFailure: true,
+  toastFailText: 'cam-mock: NOT READY - real image will be captured',
+};
+
 
 
 // ════════════════════════════════════════════════
@@ -621,6 +643,26 @@ const appliedPairipHooks = [];            // overload targets, for applyPairipLi
 const appliedInstalledPackageHooks = [];  // overload targets, for applyInstalledPackageSpoof()
 const appliedSslJavaHooks = [];           // overload targets, for applySslPinningBypass()'s Java/Kotlin layer
 const appliedSslNativeAddresses = [];     // InvocationListener[], for applySslPinningBypass()'s Flutter/BoringSSL Interceptor.attach hook — reverted via .detach()
+
+// Camera-mock module bookkeeping. Two arrays cover Java method hooks
+// (reverted via .implementation = null); the runtime Maps/Sets below
+// cover shadow ImageReader/ImageWriter pairs, per-shadow-Image spoofed
+// geometry, in-flight capture-intent launches, and the synthesized-JPEG
+// cache. cameraMockApplied is a double-init guard (same pattern as
+// contentProviderHooksApplied).
+const appliedCameraIntentHooks = [];   // L1: intent-handler hook targets
+const appliedCamera2Hooks = [];        // L2: ImageReader + dynamic Image hook targets
+let cameraMockApplied = false;
+
+const cameraPendingLaunches = new Map();  // L1: "<callingClass>#<requestCode>" -> launch entries
+const cameraReaderRegistry = new Map();   // L2: readerId -> { w, h, format, realReader, shadowSize, shadow, ... }
+const cameraShadowReaderIds = new Set();  // L2: readerIds WE created (ignore our own newInstance calls)
+const cameraShadowImageInfo = new Map();  // L2: imageId -> { w, h, format, timestamp, spawnedAt }
+const cameraHookedReaderClasses = new Set();
+const cameraHookedImageClasses = new Set();
+const cameraJpegCache = new Map();        // L2: "WxH" -> synthesized JPEG bytes
+let cameraLastPickedBytes = null;         // L1 -> L2 shared source
+let cameraLastPickedSource = null;
 
 /**
  * Serializes a value for logging without permitting a failing
@@ -2939,6 +2981,73 @@ function resolveOpenStringMap(parameters, groupKey, defaults) {
       merged[key] = value;
     } else {
       logW(`[init] parameters.${groupKey}.${key} expected string, got ${typeof value} — ignoring this key`);
+    }
+  }
+  return merged;
+}
+
+/**
+ * Resolves a configuration map with heterogeneous value types (booleans,
+ * numbers, strings, and arrays-of-strings), validating each supplied
+ * value against the type of its corresponding module-level default.
+ * A type mismatch logs a warning and retains that key's default; a
+ * missing key silently falls back to the default; an unrecognized key
+ * logs a warning and is ignored. Suited to modules whose config object
+ * mixes value shapes (e.g. cameraMockValues) rather than the
+ * homogeneous-string maps resolveMergedStringMap()/resolveOpenStringMap()
+ * were built for.
+ */
+function resolveTypedMap(parameters, groupKey, defaults) {
+  if (!parameters || !(groupKey in parameters)) {
+    return defaults;
+  }
+  const supplied = parameters[groupKey];
+  if (typeof supplied !== 'object' || supplied === null) {
+    logW(`[init] parameters.${groupKey} expected object, got ${typeof supplied} — using defaults`);
+    return defaults;
+  }
+  for (const k of Object.keys(supplied)) {
+    if (!Object.prototype.hasOwnProperty.call(defaults, k)) {
+      logW(`[init] parameters.${groupKey}.${k} is not a recognized key — ignoring`);
+    }
+  }
+  const merged = {};
+  for (const [key, defVal] of Object.entries(defaults)) {
+    if (!Object.prototype.hasOwnProperty.call(supplied, key)) {
+      merged[key] = defVal;
+      continue;
+    }
+    const v = supplied[key];
+    if (Array.isArray(defVal)) {
+      if (Array.isArray(v) && v.every((x) => typeof x === 'string')) {
+        merged[key] = v;
+      } else {
+        logW(`[init] parameters.${groupKey}.${key} expected array of strings — using default`);
+        merged[key] = defVal;
+      }
+    } else if (typeof defVal === 'boolean') {
+      if (typeof v === 'boolean') {
+        merged[key] = v;
+      } else {
+        logW(`[init] parameters.${groupKey}.${key} expected boolean, got ${typeof v} — using default`);
+        merged[key] = defVal;
+      }
+    } else if (typeof defVal === 'number') {
+      if (typeof v === 'number' && !isNaN(v)) {
+        merged[key] = v;
+      } else {
+        logW(`[init] parameters.${groupKey}.${key} expected number, got ${typeof v} — using default`);
+        merged[key] = defVal;
+      }
+    } else if (typeof defVal === 'string') {
+      if (typeof v === 'string') {
+        merged[key] = v;
+      } else {
+        logW(`[init] parameters.${groupKey}.${key} expected string, got ${typeof v} — using default`);
+        merged[key] = defVal;
+      }
+    } else {
+      merged[key] = defVal;
     }
   }
   return merged;
@@ -6102,6 +6211,1188 @@ function revertSslPinningBypass() {
 }
 
 /**
+ * Camera-input mock module — two independent layers:
+ *
+ * Mock camera-input interceptor for Android, covering the two most common ways
+ * an application consumes "the camera": the system picker contract
+ * (ACTION_IMAGE_CAPTURE) and an in-process Camera2 still-capture pipeline.
+ *
+ * LAYER 1 - Intent-based capture redirect
+ *   Many applications never touch Camera2 directly. They send
+ *   ACTION_IMAGE_CAPTURE / ACTION_IMAGE_CAPTURE_SECURE and let the system's
+ *   camera app (or any registered handler) produce the result. This layer
+ *   transparently redirects that intent through an image picker, then
+ *   delivers the picked image back through the exact contract the caller
+ *   expects: a file written to its EXTRA_OUTPUT URI, or an inline thumbnail
+ *   Bitmap under the "data" extra when no EXTRA_OUTPUT was supplied.
+ *
+ * LAYER 2 - In-process Camera2 still-capture substitution
+ *   Applications that implement their own camera UI call
+ *   ImageReader.acquireNextImage() / acquireLatestImage() to retrieve a
+ *   captured JPEG. This layer leaves the real capture pipeline completely
+ *   untouched and substitutes only the delivered Image, at the exact moment
+ *   the application asks for it (see "Why substitute at the acquire
+ *   boundary" below).
+ *
+ * SHARED SOURCE SELECTION
+ *   An image picked through Layer 1 automatically becomes Layer 2's source
+ *   image (CFG.L2_PREFER_L1_PICK), so both layers present one consistent
+ *   persona to the target application. Falls back to CFG.L2_JPEG_SOURCE (a
+ *   content:// URI, a file:// URI, or a bare absolute path), then to a
+ *   generated placeholder image if no source is configured or reachable.
+ *
+ * -----------------------------------------------------------------------
+ * ARCHITECTURE NOTES - why the code is shaped the way it is
+ * -----------------------------------------------------------------------
+ *
+ *   Why substitute at acquireNextImage()/acquireLatestImage(), not earlier
+ *   in the pipeline:
+ *     An earlier design attempted to swap a capture session's output
+ *     targets directly. It required several fragile, interdependent hooks
+ *     and produced dual-producer BufferQueue conflicts. Substituting at the
+ *     acquire boundary instead leaves the entire real pipeline - camera
+ *     open, session negotiation, capture trigger - completely unmodified;
+ *     only the Image object handed back to the caller is ever replaced.
+ *     Every substitution path fails open (returns the real image) rather
+ *     than returning null on any error.
+ *
+ *   Why a shadow ImageReader/ImageWriter pair, rather than an ImageWriter
+ *   bound directly to the real reader's Surface:
+ *     At real sensor resolutions, a userspace ImageWriter cannot reliably
+ *     dequeue into a JPEG-format ImageReader sized for the camera's native
+ *     capture dimensions; BLOB allocation at that size is a HAL-only
+ *     negotiation path. A small BLOB-sized ImageReader - sized to the JPEG
+ *     payload, not the sensor resolution - is accepted by gralloc and works
+ *     reliably. Its own ImageWriter feeds it the synthesized JPEG, and the
+ *     resulting Image is what gets handed back in place of the real one.
+ *
+ *   Why the shadow buffer is sized at (JPEG length + a fixed padding
+ *   bucket), not the exact JPEG length:
+ *     The BufferQueue reallocates the pool buffer down to the exact
+ *     jpeg_size written on the previous cycle. Writing the exact length
+ *     leaves no headroom for the next capture's trailer, overflowing on the
+ *     very next frame. Reserving a fixed padding bucket keeps the buffer
+ *     capacity stable across repeated captures; the trailing zero padding
+ *     is ignored by JPEG decoders, which stop reading at the EOI marker.
+ *
+ *   Why the shadow image's timestamp is read from the real image
+ *   immediately, before it is drained, rather than from a cached or
+ *   session-wide value:
+ *     Some applications correlate a delivered Image's timestamp against
+ *     the SENSOR_TIMESTAMP of the specific capture result that produced
+ *     it. A stale timestamp (for example, one taken from the last preview
+ *     frame) does not match, and the application silently discards the
+ *     result. Reading realImg.getTimestamp() for the exact frame being
+ *     replaced avoids this without needing any capture-callback bookkeeping.
+ *
+ *   Why plane row/pixel stride are logged but never spoofed:
+ *     The shadow reader is a genuine AOSP ImageReader(format=JPEG), so its
+ *     planes already report the natural values a real JPEG/BLOB capture
+ *     would report. Spoofing these to resemble a raw pixel-format image
+ *     would make the shadow diverge from real camera behavior rather than
+ *     match it.
+ *
+ *   Why a reader's registry entry is created only inside the "is a still
+ *   capture" branch:
+ *     ImageReader.newInstance() is also invoked internally when a shadow
+ *     reader is created (recursively, through the same hook). Gating
+ *     registry creation on the still-capture check (format and minimum
+ *     dimensions) prevents shadow readers from acquiring their own,
+ *     unused registry entries.
+ *
+ * -----------------------------------------------------------------------
+ * REAL CAMERA DEPENDENCY (Layer 1 vs Layer 2)
+ * -----------------------------------------------------------------------
+ *   - Layer 1 never touches the camera. The capture Intent is redirected to
+ *     a picker before any camera app or camera hardware is involved, so no
+ *     real camera session ever opens for an app whose capture Layer 1
+ *     intercepts successfully.
+ *   - Layer 2 REQUIRES a real, running camera. The genuine CameraDevice /
+ *     CameraCaptureSession / sensor pipeline runs completely untouched;
+ *     Layer 2 only substitutes the Image object at the point it is handed
+ *     back by ImageReader.acquireNextImage()/acquireLatestImage(). This
+ *     also means the live preview surface shows the REAL scene - only the
+ *     final captured still is substituted, at the moment it is acquired.
+ *
+ * -----------------------------------------------------------------------
+ * KNOWN LIMITATIONS
+ * -----------------------------------------------------------------------
+ *   - HEIC capture is not substituted. The Android Bitmap API has no HEIC
+ *     encoder; supporting it would require a dedicated libheif-based path.
+ *   - EXIF metadata is not preserved in the synthesized JPEG (no GPS, ISO,
+ *     lens, or maker-note fields survive re-encoding). Writing attributes
+ *     via ExifInterface after compression would close this gap.
+ *   - YUV_420_888 analysis streams are left untouched by design, so an
+ *     application's ML/QR/face-detection pipeline continues to see the
+ *     real camera feed. Substituting a continuous analysis stream in
+ *     real time is a materially harder problem, addressed separately by
+ *     the companion Layer 3 research.
+ *   - Video capture (MediaRecorder, ACTION_VIDEO_CAPTURE) is out of scope:
+ *     a different pipeline with a different interception surface.
+ *   - Requires real camera hardware; this script does not virtualize
+ *     CameraDevice/CameraCaptureSession for camera-less emulation.
+ *   - Front and back cameras draw from the same synthesized source image
+ *     by design, for persona consistency. A check that cross-compares
+ *     simultaneous front/back content would observe they are identical.
+ *   - RAW_SENSOR/RAW10/RAW12 formats are out of scope.
+ *   - When the source image's aspect ratio differs from the target
+ *     reader's, the result is center-cropped (matching typical platform
+ *     capture behavior), which discards edge content from the source.
+ *
+ *   The full development history behind these design choices - every
+ *   issue encountered, its diagnosis, and its fix - is maintained in the
+ *   project's companion research documentation, not in this file.
+ * =============================================================================
+ */
+
+// ------------------------------------------------------------------
+// Camera-mock internal constants (not exposed via cameraMockValues)
+// ------------------------------------------------------------------
+const CAM_IMAGE_FORMAT_JPEG = 256;
+
+const CAM_L1_PICKER_ORDER = ['PICK', 'PICK_IMAGES', 'GET_CONTENT'];
+const CAM_L1_USE_CHOOSER = true;
+const CAM_L1_FORCE_CAMERA_FEATURES = ['android.hardware.camera', 'android.hardware.camera.any'];
+const CAM_L1_FAKE_RESOLVE_ACTIVITY = true;
+const CAM_L1_THUMB_MAX_PX = 256;
+const CAM_L1_THUMB_BUFFER_LIMIT = 16 * 1024 * 1024;
+const CAM_L1_PENDING_TTL_MS = 10 * 60 * 1000;
+const CAM_L1_MATCH_RC_ONLY_FALLBACK = true;
+const CAM_L1_TRANSCODE_NON_JPEG = false;
+const CAM_L1_QUICK_CANCEL_MS = 1500;
+const CAM_JPEG_MIME_TYPES = ['image/jpeg', 'image/jpg', 'image/pjpeg'];
+const CAM_CAPTURE_ACTIONS = [
+  'android.media.action.IMAGE_CAPTURE',
+  'android.media.action.IMAGE_CAPTURE_SECURE'
+];
+
+const CAM_L2_JPEG_QUALITY = 92;
+const CAM_L2_PADDING_BUCKET = 64 * 1024;
+const CAM_L2_FALLBACK_TO_PLACEHOLDER = true;
+const CAM_L2_PREFER_L1_PICK = true;
+const CAM_L2_SHADOW_MAX_IMAGES = 4;
+const CAM_L2_SHADOW_MIN_BYTES = 24 * 1024 * 1024;
+const CAM_L2_SHADOW_SIZE_CAP_MB = 100;
+const CAM_L2_BYTES_PER_PIXEL_ESTIMATE = 0.5;
+const CAM_L2_MIN_STILL_W = 640;
+const CAM_L2_MIN_STILL_H = 480;
+
+const CAM_JPEG_TRAILER_SIZE = 8;
+const CAM_CAMERA3_JPEG_BLOB_ID = 0x00FF;
+const CAM_MAX_DEQUEUE_ATTEMPTS = 4;
+const CAM_MAX_CONSECUTIVE_BAD_BUFFERS = 2;
+const CAM_ACQUIRE_POLL_ATTEMPTS = 20;
+const CAM_ACQUIRE_POLL_INTERVAL_MS = 10;
+
+// L1 recursion guard: set true while forwarding the ORIGINAL capture intent
+// (after all picker modes failed), so isCaptureIntent() doesn't re-hijack it.
+let cameraBypassActive = false;
+
+// ------------------------------------------------------------------
+// Camera-mock shared helpers (used by both layers)
+// ------------------------------------------------------------------
+
+function cameraClassNameOf(o) {
+  try { return '' + o.getClass().getName(); } catch (e) { return '?'; }
+}
+function cameraIdOf(o) {
+  try { return Java.use('java.lang.System').identityHashCode(o); } catch (e) { return -1; }
+}
+function cameraReaderKey(r) {
+  try { return '' + cameraIdOf(r); } catch (e) { return '?'; }
+}
+function cameraToNumber(v) {
+  if (typeof v === 'number') return v;
+  if (v === null || v === undefined) return 0;
+  try { return Number('' + v); } catch (e) { return 0; }
+}
+
+function cameraGetAppContext() {
+  try { return Java.use('android.app.ActivityThread').currentApplication() || null; }
+  catch (e) { return null; }
+}
+
+function cameraShowToast(text, long_) {
+  try {
+    Java.scheduleOnMainThread(function () {
+      try {
+        const ctx = cameraGetAppContext();
+        if (ctx === null) { logW('[CameraMock][toast] no application context available'); return; }
+        const Toast = Java.use('android.widget.Toast');
+        const duration = long_ ? Toast.LENGTH_LONG.value : Toast.LENGTH_SHORT.value;
+        const t = Toast.makeText.overload(
+          'android.content.Context', 'java.lang.CharSequence', 'int'
+        ).call(Toast, ctx, text, duration);
+        t.show();
+      } catch (e) { logE('[CameraMock][toast] show failed: ' + e); }
+    });
+  } catch (e) { logE('[CameraMock][toast] schedule failed: ' + e); }
+}
+
+function cameraReadAllBytes(is) {
+  const ByteArrayOutputStream = Java.use('java.io.ByteArrayOutputStream');
+  const InputStream = Java.use('java.io.InputStream');
+  const baos = ByteArrayOutputStream.$new();
+  const rd = Java.cast(is, InputStream);
+  try {
+    const buf = Java.array('byte', new Array(8192).fill(0));
+    let n;
+    while ((n = rd.read(buf)) > 0) baos.write(buf, 0, n);
+  } finally { try { is.close(); } catch (e) {} }
+  return baos.toByteArray();
+}
+
+function cameraNormalizeSourceUri(s) {
+  if (s === null || s === undefined) return null;
+  s = String(s).trim();
+  if (s.length === 0) return null;
+  if (s === 'placeholder' || s.indexOf('placeholder:') === 0) return null;
+  if (s.indexOf('content://') === 0) return s;
+  if (s.indexOf('content:') === 0) return 'content://' + s.substring(8);
+  if (s.indexOf('file:///') === 0) return s;
+  if (s.indexOf('file://') === 0) return s;
+  if (s.indexOf('file:/') === 0) return 'file://' + s.substring(5);
+  if (s.indexOf('file:') === 0) return 'file:///' + s.substring(5);
+  if (s.charAt(0) === '/') return 'file://' + s;
+  logW('[CameraMock][src] relative path not supported: "' + s + '"; provide an absolute path or a URI');
+  return null;
+}
+
+function cameraGetExifRotationDegrees(exifInputStream) {
+  try {
+    const ExifInterface = Java.use('android.media.ExifInterface');
+    const ex = ExifInterface.$new.overload('java.io.InputStream').call(ExifInterface, exifInputStream);
+    const orientation = ex.getAttributeInt('Orientation', 1);
+    return (orientation === 6) ? 90 : (orientation === 3) ? 180 : (orientation === 8) ? 270 : 0;
+  } catch (e) { return 0; }
+}
+
+function cameraExifRotationDegreesFromOpener(openStream) {
+  let is = null;
+  try { is = openStream(); return cameraGetExifRotationDegrees(is); }
+  catch (e) { return 0; }
+  finally { try { if (is !== null) is.close(); } catch (e) {} }
+}
+
+function cameraRotateBitmap(bmp, degrees) {
+  if (degrees === 0) return bmp;
+  try {
+    const Bitmap = Java.use('android.graphics.Bitmap');
+    const Matrix = Java.use('android.graphics.Matrix');
+    const m = Matrix.$new();
+    m.postRotate.overload('float').call(m, degrees);
+    const rotated = Bitmap.createBitmap.overload(
+      'android.graphics.Bitmap', 'int', 'int', 'int', 'int',
+      'android.graphics.Matrix', 'boolean'
+    ).call(Bitmap, bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), m, true);
+    if (rotated !== bmp) bmp.recycle();
+    return rotated;
+  } catch (e) { return bmp; }
+}
+
+function cameraFitToDimensions(srcBmp, targetW, targetH) {
+  const Bitmap = Java.use('android.graphics.Bitmap');
+  const sw = srcBmp.getWidth(), sh = srcBmp.getHeight();
+  const srcAspect = sw / sh, tgtAspect = targetW / targetH;
+  let scaledW, scaledH;
+  if (srcAspect > tgtAspect) { scaledH = targetH; scaledW = Math.max(1, Math.round(sw * (targetH / sh))); }
+  else                        { scaledW = targetW; scaledH = Math.max(1, Math.round(sh * (targetW / sw))); }
+  const scaled = Bitmap.createScaledBitmap(srcBmp, scaledW, scaledH, true);
+  if (scaled !== srcBmp) srcBmp.recycle();
+  if (scaledW === targetW && scaledH === targetH) return scaled;
+  const x = Math.max(0, Math.floor((scaledW - targetW) / 2));
+  const y = Math.max(0, Math.floor((scaledH - targetH) / 2));
+  const cropped = Bitmap.createBitmap.overload(
+    'android.graphics.Bitmap', 'int', 'int', 'int', 'int'
+  ).call(Bitmap, scaled, x, y, targetW, targetH);
+  if (cropped !== scaled) scaled.recycle();
+  return cropped;
+}
+
+function cameraLoadSourceBytes() {
+  if (CAM_L2_PREFER_L1_PICK && cameraLastPickedBytes !== null) {
+    logD('[CameraMock][src] using last Layer-1-picked image (' + cameraLastPickedBytes.length + 'B)');
+    return cameraLastPickedBytes;
+  }
+  const normalized = cameraNormalizeSourceUri(cameraMockValues.jpegSource);
+  if (normalized === null) {
+    logD('[CameraMock][src] placeholder/none; placeholder will be used');
+    return null;
+  }
+  const ctx = cameraGetAppContext();
+  if (ctx === null) { logW('[CameraMock][src] no application context available'); return null; }
+  try {
+    const Uri = Java.use('android.net.Uri');
+    const is = ctx.getContentResolver().openInputStream(Uri.parse(normalized));
+    if (is === null) { logW('[CameraMock][src] openInputStream returned null for ' + normalized); return null; }
+    const bytes = cameraReadAllBytes(is);
+    logI('[CameraMock][src] loaded ' + bytes.length + 'B from ' + normalized);
+    return bytes;
+  } catch (e) { logE('[CameraMock][src] load failed: ' + e); return null; }
+}
+
+function cameraSynthesizeRealJpeg(sourceBytes, targetW, targetH) {
+  const BitmapFactory = Java.use('android.graphics.BitmapFactory');
+  const Bitmap = Java.use('android.graphics.Bitmap');
+  const ByteArrayInputStream = Java.use('java.io.ByteArrayInputStream');
+  const ByteArrayOutputStream = Java.use('java.io.ByteArrayOutputStream');
+  const CompressFormat = Java.use('android.graphics.Bitmap$CompressFormat');
+  const Options = Java.use('android.graphics.BitmapFactory$Options');
+  const boundsOpts = Options.$new();
+  boundsOpts.inJustDecodeBounds.value = true;
+  BitmapFactory.decodeByteArray(sourceBytes, 0, sourceBytes.length, boundsOpts);
+  const sw = boundsOpts.outWidth.value, sh = boundsOpts.outHeight.value;
+  if (sw <= 0 || sh <= 0) throw new Error('source bounds decode failed');
+  let sampleSize = 1;
+  const maxTarget = Math.max(targetW, targetH);
+  while (Math.max(sw, sh) / (sampleSize * 2) >= maxTarget) sampleSize *= 2;
+  const decodeOpts = Options.$new();
+  decodeOpts.inSampleSize.value = sampleSize;
+  let src = BitmapFactory.decodeByteArray(sourceBytes, 0, sourceBytes.length, decodeOpts);
+  if (src === null) throw new Error('source decode failed (sampleSize=' + sampleSize + ')');
+  const degrees = cameraGetExifRotationDegrees(ByteArrayInputStream.$new(sourceBytes));
+  src = cameraRotateBitmap(src, degrees);
+  const fitted = cameraFitToDimensions(src, targetW, targetH);
+  const baos = ByteArrayOutputStream.$new();
+  if (!fitted.compress(CompressFormat.valueOf('JPEG'), CAM_L2_JPEG_QUALITY, baos)) {
+    fitted.recycle();
+    throw new Error('re-encode compress failed');
+  }
+  fitted.recycle();
+  return baos.toByteArray();
+}
+
+function cameraMakePlaceholderJpeg(w, h, quality) {
+  const Bitmap = Java.use('android.graphics.Bitmap');
+  const BitmapConfig = Java.use('android.graphics.Bitmap$Config');
+  const Canvas = Java.use('android.graphics.Canvas');
+  const Paint = Java.use('android.graphics.Paint');
+  const ByteArrayOutputStream = Java.use('java.io.ByteArrayOutputStream');
+  const CompressFormat = Java.use('android.graphics.Bitmap$CompressFormat');
+  const bmp = Bitmap.createBitmap(w, h, BitmapConfig.valueOf('ARGB_8888'));
+  try {
+    const canvas = Canvas.$new(bmp);
+    const paint = Paint.$new();
+    paint.setColor(0xFF2060A0 | 0);
+    canvas.drawRect(0.0, 0.0, w * 1.0, h * 1.0, paint);
+    paint.setColor(0xFFFFFFFF | 0);
+    canvas.drawRect(0.0, 0.0, (w / 4) * 1.0, (h / 4) * 1.0, paint);
+  } catch (e) { logW('[CameraMock][src] placeholder paint failed: ' + e); }
+  const baos = ByteArrayOutputStream.$new();
+  if (!bmp.compress(CompressFormat.valueOf('JPEG'), quality, baos)) throw new Error('placeholder compress failed');
+  const bytes = baos.toByteArray();
+  bmp.recycle();
+  return bytes;
+}
+
+function cameraGetJpegForDimensions(w, h) {
+  const key = w + 'x' + h;
+  if (cameraJpegCache.has(key)) return cameraJpegCache.get(key);
+  let bytes = null;
+  const src = cameraLoadSourceBytes();
+  if (src !== null) {
+    try { bytes = cameraSynthesizeRealJpeg(src, w, h); }
+    catch (e) { logE('[CameraMock][src] synthesis failed: ' + e); }
+  }
+  if (bytes === null) {
+    if (!CAM_L2_FALLBACK_TO_PLACEHOLDER) throw new Error('source unavailable, placeholder fallback disabled');
+    bytes = cameraMakePlaceholderJpeg(w, h, 90);
+    logI('[CameraMock][src] placeholder fallback ' + key + ': ' + bytes.length + 'B');
+  } else {
+    logI('[CameraMock][src] synthesized jpeg ' + key + ': ' + bytes.length + 'B');
+  }
+  cameraJpegCache.set(key, bytes);
+  return bytes;
+}
+
+// ------------------------------------------------------------------
+// Camera-mock Layer 1 (intent-based capture redirect)
+// ------------------------------------------------------------------
+
+function applyCameraIntentMock(values) {
+  logI('[CameraMock][L1] initializing...');
+  try {
+    const Activity = Java.use('android.app.Activity');
+    const Intent = Java.use('android.content.Intent');
+
+    function prunePendingLaunches() {
+      const now = Date.now();
+      cameraPendingLaunches.forEach(function (queue, key) {
+        const kept = queue.filter(function (entry) { return now - entry.t0 < CAM_L1_PENDING_TTL_MS; });
+        if (kept.length === 0) cameraPendingLaunches.delete(key);
+        else if (kept.length !== queue.length) cameraPendingLaunches.set(key, kept);
+      });
+    }
+    function pushPendingLaunch(key, entry) {
+      prunePendingLaunches();
+      let queue = cameraPendingLaunches.get(key);
+      if (queue === undefined) { queue = []; cameraPendingLaunches.set(key, queue); }
+      queue.push(entry);
+    }
+    function popPendingLaunch(callingClass, requestCode) {
+      prunePendingLaunches();
+      let key = callingClass + '#' + requestCode;
+      let queue = cameraPendingLaunches.get(key);
+      if (queue === undefined || queue.length === 0) {
+        if (!CAM_L1_MATCH_RC_ONLY_FALLBACK) return undefined;
+        let fallbackKey = null;
+        cameraPendingLaunches.forEach(function (v, k) {
+          if (fallbackKey === null && v.length > 0 && k.endsWith('#' + requestCode)) fallbackKey = k;
+        });
+        if (fallbackKey === null) return undefined;
+        key = fallbackKey; queue = cameraPendingLaunches.get(key);
+      }
+      const entry = queue.pop();
+      if (queue.length === 0) cameraPendingLaunches.delete(key);
+      return entry;
+    }
+    function dropPendingLaunch(key, entry) {
+      const queue = cameraPendingLaunches.get(key);
+      if (queue === undefined) return;
+      const i = queue.indexOf(entry);
+      if (i >= 0) queue.splice(i, 1);
+      if (queue.length === 0) cameraPendingLaunches.delete(key);
+    }
+    function isCaptureIntent(intent) {
+      if (cameraBypassActive || intent === null) return false;
+      try { return CAM_CAPTURE_ACTIONS.indexOf(intent.getAction()) !== -1; } catch (e) { return false; }
+    }
+    function extractPickedUri(data) {
+      if (data === null) return null;
+      try { const u = data.getData(); if (u !== null) return u; } catch (e) {}
+      try {
+        const clip = data.getClipData();
+        if (clip !== null && clip.getItemCount() > 0) return clip.getItemAt(0).getUri();
+      } catch (e) {}
+      return null;
+    }
+    function openOutputStream(resolver, dst) {
+      try { const os = resolver.openOutputStream(dst, 'wt'); if (os !== null) return os; }
+      catch (e) {}
+      return resolver.openOutputStream(dst, 'w');
+    }
+    function transcodeToJpeg(resolver, src, dst) {
+      const BitmapFactory = Java.use('android.graphics.BitmapFactory');
+      const CompressFormat = Java.use('android.graphics.Bitmap$CompressFormat');
+      const is = resolver.openInputStream(src);
+      if (is === null) throw new Error('transcode: null input stream');
+      let bmp;
+      try { bmp = BitmapFactory.decodeStream.overload('java.io.InputStream').call(BitmapFactory, is); }
+      finally { is.close(); }
+      if (bmp === null) throw new Error('transcode: decode failed');
+      const os = openOutputStream(resolver, dst);
+      try {
+        if (!bmp.compress(CompressFormat.valueOf('JPEG'), 95, os)) throw new Error('transcode: compress failed');
+        os.flush();
+      } finally { os.close(); }
+    }
+    function copyPickedImage(resolver, src, dst) {
+      const InputStream = Java.use('java.io.InputStream');
+      const OutputStream = Java.use('java.io.OutputStream');
+      let mimeType = null;
+      try { const t = resolver.getType(src); mimeType = (t === null) ? null : ('' + t).toLowerCase(); } catch (e) {}
+      const needsTranscode = CAM_L1_TRANSCODE_NON_JPEG && mimeType !== null
+        && mimeType.indexOf('image/') === 0 && CAM_JPEG_MIME_TYPES.indexOf(mimeType) === -1;
+      if (needsTranscode) {
+        logI('[CameraMock][L1] picked type ' + mimeType + ' is not JPEG -> transcoding');
+        transcodeToJpeg(resolver, src, dst);
+        return -1;
+      }
+      const is = resolver.openInputStream(src);
+      if (is === null) throw new Error('openInputStream(src) returned null');
+      const reader = Java.cast(is, InputStream);
+      let os = null, total = 0;
+      try {
+        os = openOutputStream(resolver, dst);
+        if (os === null) throw new Error('openOutputStream(dst) returned null');
+        const writer = Java.cast(os, OutputStream);
+        const buf = Java.array('byte', new Array(8192).fill(0));
+        let n;
+        while ((n = reader.read(buf)) > 0) { writer.write(buf, 0, n); total += n; }
+        writer.flush();
+      } finally {
+        if (os !== null) os.close();
+        is.close();
+      }
+      return total;
+    }
+    function memoizedOpener(openFn) {
+      const ByteArrayInputStream = Java.use('java.io.ByteArrayInputStream');
+      const ByteArrayOutputStream = Java.use('java.io.ByteArrayOutputStream');
+      const InputStream = Java.use('java.io.InputStream');
+      let bytes = null, exceededLimit = false;
+      return function () {
+        if (exceededLimit) return openFn();
+        if (bytes === null) {
+          const is = openFn();
+          if (is === null) throw new Error('openInputStream returned null');
+          const baos = ByteArrayOutputStream.$new();
+          const reader = Java.cast(is, InputStream);
+          let total = 0;
+          try {
+            const buf = Java.array('byte', new Array(8192).fill(0));
+            let n;
+            while ((n = reader.read(buf)) > 0) {
+              baos.write(buf, 0, n);
+              total += n;
+              if (total > CAM_L1_THUMB_BUFFER_LIMIT) { exceededLimit = true; break; }
+            }
+          } finally { is.close(); }
+          if (exceededLimit) return openFn();
+          bytes = baos.toByteArray();
+        }
+        return ByteArrayInputStream.$new(bytes);
+      };
+    }
+    function decodeScaled(openStream, maxDimensionPx) {
+      const BitmapFactory = Java.use('android.graphics.BitmapFactory');
+      const Options = Java.use('android.graphics.BitmapFactory$Options');
+      const DecodeStream = BitmapFactory.decodeStream.overload(
+        'java.io.InputStream', 'android.graphics.Rect', 'android.graphics.BitmapFactory$Options');
+      const boundsOpts = Options.$new();
+      boundsOpts.inJustDecodeBounds.value = true;
+      let is = openStream();
+      try { DecodeStream.call(BitmapFactory, is, null, boundsOpts); } finally { is.close(); }
+      const w = boundsOpts.outWidth.value, h = boundsOpts.outHeight.value;
+      if (w <= 0 || h <= 0) throw new Error('bounds decode failed');
+      let sampleSize = 1;
+      while ((Math.max(w, h) / (sampleSize * 2)) >= maxDimensionPx) sampleSize *= 2;
+      const decodeOpts = Options.$new();
+      decodeOpts.inSampleSize.value = sampleSize;
+      is = openStream();
+      let bmp;
+      try { bmp = DecodeStream.call(BitmapFactory, is, null, decodeOpts); } finally { is.close(); }
+      if (bmp === null) throw new Error('decodeStream returned null');
+      return bmp;
+    }
+    function buildThumbnailResultIntent(openStream) {
+      const Bitmap = Java.use('android.graphics.Bitmap');
+      let bmp = decodeScaled(openStream, CAM_L1_THUMB_MAX_PX);
+      const longestSide = Math.max(bmp.getWidth(), bmp.getHeight());
+      if (longestSide > CAM_L1_THUMB_MAX_PX) {
+        const scale = CAM_L1_THUMB_MAX_PX / longestSide;
+        bmp = Bitmap.createScaledBitmap(
+          bmp,
+          Math.max(1, Math.round(bmp.getWidth() * scale)),
+          Math.max(1, Math.round(bmp.getHeight() * scale)),
+          true);
+      }
+      bmp = cameraRotateBitmap(bmp, cameraExifRotationDegreesFromOpener(openStream));
+      const result = Intent.$new();
+      result.putExtra.overload('java.lang.String', 'android.os.Parcelable').call(result, 'data', bmp);
+      return result;
+    }
+    function buildPickerIntent(mode) {
+      let intent;
+      if (mode === 'PICK') {
+        const MediaStoreImages = Java.use('android.provider.MediaStore$Images$Media');
+        intent = Intent.$new('android.intent.action.PICK', MediaStoreImages.EXTERNAL_CONTENT_URI.value);
+        intent.setType('image/*');
+      } else if (mode === 'PICK_IMAGES') {
+        intent = Intent.$new('android.provider.action.PICK_IMAGES');
+        intent.setType('image/*');
+      } else {
+        intent = Intent.$new('android.intent.action.GET_CONTENT');
+        intent.setType('image/*');
+        intent.addCategory('android.intent.category.OPENABLE');
+      }
+      return intent;
+    }
+    function countHandlers(ctx, intent, mode) {
+      try {
+        const ResolveInfo = Java.use('android.content.pm.ResolveInfo');
+        const results = ctx.getPackageManager().queryIntentActivities(intent, 0);
+        const packageNames = [];
+        for (let i = 0; i < results.size(); i++) {
+          packageNames.push(Java.cast(results.get(i), ResolveInfo).activityInfo.value.packageName.value);
+        }
+        logD('[CameraMock][L1] handlers for ' + mode + ' (' + packageNames.length + ')');
+        return packageNames.length;
+      } catch (e) { return -1; }
+    }
+    function redirectCaptureLaunch(ctx, callingClass, intent, requestCode, via, launch) {
+      const Uri = Java.use('android.net.Uri');
+      let extraOutput = null;
+      try { const o = intent.getParcelableExtra('output'); extraOutput = o ? Java.cast(o, Uri) : null; } catch (e) {}
+      const key = callingClass + '#' + requestCode;
+      const entry = { out: extraOutput, mode: null, t0: Date.now() };
+      pushPendingLaunch(key, entry);
+      logI('[CameraMock][L1] LAUNCH[' + via + '] ' + key + ' action=' + intent.getAction() + ' EXTRA_OUTPUT=' + extraOutput);
+      const SDK = Java.use('android.os.Build$VERSION').SDK_INT.value;
+      const candidateModes = CAM_L1_PICKER_ORDER.filter(function (m) { return !(m === 'PICK_IMAGES' && SDK < 33); });
+      let lastError = null;
+      for (let i = 0; i < candidateModes.length; i++) {
+        try {
+          const basePicker = buildPickerIntent(candidateModes[i]);
+          const handlerCount = countHandlers(ctx, basePicker, candidateModes[i]);
+          const useChooser = CAM_L1_USE_CHOOSER && handlerCount > 0;
+          let pickerIntent = basePicker;
+          if (useChooser) {
+            try {
+              const CharSequence = Java.use('java.lang.CharSequence');
+              pickerIntent = Intent.createChooser(
+                basePicker, Java.cast(Java.use('java.lang.String').$new('Select image'), CharSequence));
+            } catch (chooserError) { pickerIntent = basePicker; }
+          }
+          entry.mode = candidateModes[i];
+          entry.t0 = Date.now();
+          logI('[CameraMock][L1] LAUNCH picker mode=' + candidateModes[i] + (pickerIntent !== basePicker ? ' (chooser)' : ' (direct)'));
+          return launch(pickerIntent);
+        } catch (e) { lastError = e; logW('[CameraMock][L1] picker mode ' + candidateModes[i] + ' failed: ' + e); }
+      }
+      dropPendingLaunch(key, entry);
+      logW('[CameraMock][L1] all picker modes failed (' + lastError + '); passing original capture intent through unmodified');
+      cameraBypassActive = true;
+      try { return launch(intent); } finally { cameraBypassActive = false; }
+    }
+    function cacheForLayer2(resolver, src, label) {
+      if (!CAM_L2_PREFER_L1_PICK) return;
+      try {
+        const is = resolver.openInputStream(src);
+        if (is !== null) {
+          cameraLastPickedBytes = cameraReadAllBytes(is);
+          cameraLastPickedSource = '' + src;
+          cameraJpegCache.clear();
+          logI('[CameraMock][shared] Layer-1 ' + label + ' cached for Layer 2: ' + cameraLastPickedBytes.length + 'B (jpeg cache cleared)');
+        }
+      } catch (e) { logE('[CameraMock][shared] caching ' + label + ' failed: ' + e); }
+    }
+    function deliverCaptureResult(resolver, src, pending, forward) {
+      try {
+        if (pending.out !== null) {
+          const byteCount = copyPickedImage(resolver, src, pending.out);
+          logI('[CameraMock][L1] COPIED ' + (byteCount < 0 ? '(transcoded)' : byteCount + ' bytes') + ' -> ' + pending.out);
+          cacheForLayer2(resolver, src, 'pick');
+          return forward(-1, null); // RESULT_OK
+        }
+        const thumbnailResult = buildThumbnailResultIntent(memoizedOpener(function () { return resolver.openInputStream(src); }));
+        logI('[CameraMock][L1] THUMBNAIL result built');
+        cacheForLayer2(resolver, src, 'thumbnail');
+        return forward(-1, thumbnailResult); // RESULT_OK
+      } catch (e) {
+        logE('[CameraMock][L1] result delivery failed -> RESULT_CANCELED: ' + e);
+        return forward(0, null); // RESULT_CANCELED
+      }
+    }
+
+    // ---- Hook: force camera features present ----
+    if (CAM_L1_FORCE_CAMERA_FEATURES.length > 0) {
+      try {
+        const AppPackageManager = Java.use('android.app.ApplicationPackageManager');
+        AppPackageManager.hasSystemFeature.overloads.forEach(function (ov) {
+          if (ov.argumentTypes[0].className !== 'java.lang.String') return;
+          ov.implementation = function () {
+            const args = Array.prototype.slice.call(arguments);
+            const real = ov.apply(this, args);
+            if (!real && args[0] !== null && CAM_L1_FORCE_CAMERA_FEATURES.indexOf('' + args[0]) !== -1) return true;
+            return real;
+          };
+          appliedCameraIntentHooks.push(ov);
+        });
+        logI('[CameraMock][L1] hooked ApplicationPackageManager.hasSystemFeature');
+      } catch (e) { logE('[CameraMock][L1] hasSystemFeature hook failed: ' + e); }
+    }
+
+    // ---- Hooks: fake a camera app handler ----
+    if (CAM_L1_FAKE_RESOLVE_ACTIVITY) {
+      try {
+        const resolveActivityOv = Intent.resolveActivity.overload('android.content.pm.PackageManager');
+        resolveActivityOv.implementation = function (pm) {
+          const real = resolveActivityOv.call(this, pm);
+          if (real === null && isCaptureIntent(this)) {
+            return Java.use('android.content.ComponentName').$new('android', 'mock.Camera');
+          }
+          return real;
+        };
+        appliedCameraIntentHooks.push(resolveActivityOv);
+        logI('[CameraMock][L1] hooked Intent.resolveActivity');
+      } catch (e) { logE('[CameraMock][L1] Intent.resolveActivity hook failed: ' + e); }
+
+      try {
+        const AppPackageManager = Java.use('android.app.ApplicationPackageManager');
+        const ResolveInfo = Java.use('android.content.pm.ResolveInfo');
+        const ActivityInfo = Java.use('android.content.pm.ActivityInfo');
+        const ApplicationInfo = Java.use('android.content.pm.ApplicationInfo');
+        const ArrayList = Java.use('java.util.ArrayList');
+        function buildFakeResolveInfo() {
+          const appInfo = ApplicationInfo.$new();
+          appInfo.packageName.value = 'android';
+          const activityInfo = ActivityInfo.$new();
+          activityInfo.packageName.value = 'android';
+          activityInfo.name.value = 'mock.Camera';
+          activityInfo.applicationInfo.value = appInfo;
+          const resolveInfo = ResolveInfo.$new();
+          resolveInfo.activityInfo.value = activityInfo;
+          return resolveInfo;
+        }
+        AppPackageManager.resolveActivity.overloads.forEach(function (ov) {
+          if (ov.argumentTypes[0].className !== 'android.content.Intent') return;
+          ov.implementation = function () {
+            const args = Array.prototype.slice.call(arguments);
+            const real = ov.apply(this, args);
+            if (real === null && isCaptureIntent(args[0])) return buildFakeResolveInfo();
+            return real;
+          };
+          appliedCameraIntentHooks.push(ov);
+        });
+        AppPackageManager.queryIntentActivities.overloads.forEach(function (ov) {
+          if (ov.argumentTypes[0].className !== 'android.content.Intent') return;
+          ov.implementation = function () {
+            const args = Array.prototype.slice.call(arguments);
+            const real = ov.apply(this, args);
+            if (isCaptureIntent(args[0]) && (real === null || real.isEmpty())) {
+              const list = ArrayList.$new();
+              list.add.overload('java.lang.Object').call(list, buildFakeResolveInfo());
+              return list;
+            }
+            return real;
+          };
+          appliedCameraIntentHooks.push(ov);
+        });
+        logI('[CameraMock][L1] hooked PackageManager.resolveActivity / queryIntentActivities');
+      } catch (e) { logE('[CameraMock][L1] PackageManager resolve hooks failed: ' + e); }
+    }
+
+    // ---- Hook: Activity.startActivityForResult ----
+    try {
+      const startActivityForResultOv = Activity.startActivityForResult.overload(
+        'android.content.Intent', 'int', 'android.os.Bundle');
+      startActivityForResultOv.implementation = function (intent, requestCode, options) {
+        const self = this;
+        if (requestCode >= 0 && isCaptureIntent(intent)) {
+          return redirectCaptureLaunch(self, cameraClassNameOf(self), intent, requestCode, 'Activity',
+            function (redirected) { return startActivityForResultOv.call(self, redirected, requestCode, options); });
+        }
+        return startActivityForResultOv.call(self, intent, requestCode, options);
+      };
+      appliedCameraIntentHooks.push(startActivityForResultOv);
+      logI('[CameraMock][L1] hooked Activity.startActivityForResult');
+    } catch (e) { logE('[CameraMock][L1] Activity launch hook failed: ' + e); }
+
+    // ---- Hook: Instrumentation.execStartActivity ----
+    try {
+      const Instrumentation = Java.use('android.app.Instrumentation');
+      Instrumentation.execStartActivity.overloads.forEach(function (ov) {
+        const types = ov.argumentTypes.map(function (t) { return t.className; });
+        const intentIndex = types.indexOf('android.content.Intent');
+        if (intentIndex < 0 || types[intentIndex + 1] !== 'int') return;
+        ov.implementation = function () {
+          const self = this;
+          const args = Array.prototype.slice.call(arguments);
+          const intent = args[intentIndex], requestCode = args[intentIndex + 1];
+          if (requestCode >= 0 && isCaptureIntent(intent)) {
+            return redirectCaptureLaunch(args[0], cameraClassNameOf(args[0]), intent, requestCode, 'Instrumentation',
+              function (redirected) {
+                const redirectedArgs = args.slice();
+                redirectedArgs[intentIndex] = redirected;
+                return ov.apply(self, redirectedArgs);
+              });
+          }
+          return ov.apply(self, args);
+        };
+        appliedCameraIntentHooks.push(ov);
+      });
+      logI('[CameraMock][L1] hooked Instrumentation.execStartActivity');
+    } catch (e) { logE('[CameraMock][L1] Instrumentation hook failed: ' + e); }
+
+    // ---- Hook: Activity.dispatchActivityResult ----
+    let resultHooksInstalled = 0;
+    try {
+      Activity.dispatchActivityResult.overloads.forEach(function (ov) {
+        const types = ov.argumentTypes.map(function (t) { return t.className; });
+        const intentIndex = types.indexOf('android.content.Intent');
+        if (types[0] !== 'java.lang.String' || types[1] !== 'int' || types[2] !== 'int' || intentIndex < 0) return;
+        ov.implementation = function () {
+          const self = this;
+          const args = Array.prototype.slice.call(arguments);
+          const requestCode = args[1], resultCode = args[2], data = args[intentIndex];
+          const forward = function (newResultCode, newData) {
+            const forwardedArgs = args.slice();
+            forwardedArgs[2] = newResultCode;
+            forwardedArgs[intentIndex] = newData;
+            return ov.apply(self, forwardedArgs);
+          };
+          const pending = popPendingLaunch(cameraClassNameOf(self), requestCode);
+          if (pending === undefined) return ov.apply(self, args);
+          const elapsedMs = Date.now() - pending.t0;
+          const RESULT_OK = -1;
+          logI('[CameraMock][L1] RESULT[' + types.length + '-arg] requestCode=' + requestCode
+            + ' resultCode=' + resultCode + ' after ' + elapsedMs + 'ms mode=' + pending.mode);
+          const pickedSrc = (resultCode === RESULT_OK) ? extractPickedUri(data) : null;
+          if (pickedSrc === null) {
+            if (resultCode === RESULT_OK) {
+              logW('[CameraMock][L1] RESULT_OK but no usable URI -> converting to RESULT_CANCELED');
+              return forward(0, null);
+            }
+            if (elapsedMs < CAM_L1_QUICK_CANCEL_MS) logW('[CameraMock][L1] picker closed after ' + elapsedMs + 'ms with no result');
+            return ov.apply(self, args);
+          }
+          return deliverCaptureResult(self.getContentResolver(), pickedSrc, pending, forward);
+        };
+        appliedCameraIntentHooks.push(ov);
+        resultHooksInstalled++;
+      });
+    } catch (e) { logE('[CameraMock][L1] dispatchActivityResult hook failed: ' + e); }
+    if (resultHooksInstalled === 0) logE('[CameraMock][L1] no dispatchActivityResult overload was hooked');
+    else logI('[CameraMock][L1] hooked Activity.dispatchActivityResult (' + resultHooksInstalled + ' overload(s))');
+
+    logI('[CameraMock][L1] ready');
+  } catch (err) {
+    logE('[CameraMock][L1] setup failed: ' + err);
+    throw err;
+  }
+}
+
+// ------------------------------------------------------------------
+// Camera-mock Layer 2 (Camera2 in-process still-capture substitution)
+// ------------------------------------------------------------------
+
+function applyCamera2Mock(values) {
+  logI('[CameraMock][L2] initializing...');
+  try {
+    const ImageReader = Java.use('android.media.ImageReader');
+    const ImageWriter = Java.use('android.media.ImageWriter');
+    const ByteOrder = Java.use('java.nio.ByteOrder');
+    const Thread = Java.use('java.lang.Thread');
+
+    function computeShadowSize(w, h) {
+      if (w === null || h === null || w <= 0 || h <= 0) return null;
+      const estimated = Math.ceil(w * h * CAM_L2_BYTES_PER_PIXEL_ESTIMATE) + CAM_L2_PADDING_BUCKET;
+      const size = Math.max(CAM_L2_SHADOW_MIN_BYTES, estimated);
+      const cap = CAM_L2_SHADOW_SIZE_CAP_MB * 1024 * 1024;
+      return (size > cap) ? null : size;
+    }
+
+    function writeJpegIntoBuffer(img, jpegBytes) {
+      const plane = img.getPlanes()[0];
+      const buffer = plane.getBuffer();
+      const capacity = buffer.capacity();
+      const required = jpegBytes.length + CAM_JPEG_TRAILER_SIZE;
+      if (capacity < required) throw new Error('buffer too small (capacity=' + capacity + ', required=' + required + ')');
+      const desiredJpegSize = jpegBytes.length + CAM_L2_PADDING_BUCKET;
+      const targetJpegSize = Math.min(capacity - CAM_JPEG_TRAILER_SIZE, desiredJpegSize);
+      const padLength = targetJpegSize - jpegBytes.length;
+      buffer.clear();
+      buffer.put(jpegBytes);
+      if (padLength > 0) buffer.put(Java.array('byte', new Array(padLength).fill(0)));
+      buffer.order(ByteOrder.LITTLE_ENDIAN.value);
+      buffer.position(capacity - CAM_JPEG_TRAILER_SIZE);
+      buffer.putShort(CAM_CAMERA3_JPEG_BLOB_ID & 0xFFFF);
+      buffer.putShort(0);
+      buffer.putInt(targetJpegSize);
+      return { capacity: capacity, targetJpegSize: targetJpegSize };
+    }
+
+    function tryDequeueSufficientBuffer(info, requiredBytes) {
+      const rejectedCapacities = [];
+      for (let attempt = 0; attempt < CAM_MAX_DEQUEUE_ATTEMPTS; attempt++) {
+        let candidate = null;
+        try { candidate = info.shadow.writer.dequeueInputImage(); } catch (e) { break; }
+        if (candidate === null) break;
+        try {
+          const capacity = candidate.getPlanes()[0].getBuffer().capacity();
+          if (capacity >= requiredBytes) return { image: candidate, rejectedCapacities: rejectedCapacities };
+          rejectedCapacities.push(capacity);
+          try { candidate.close(); } catch (e) {}
+        } catch (e) { try { candidate.close(); } catch (e2) {} }
+      }
+      return { image: null, rejectedCapacities: rejectedCapacities };
+    }
+
+    function markAsShadowImage(img, w, h, format, timestamp) {
+      cameraShadowImageInfo.set(cameraIdOf(img), {
+        w: w, h: h, format: format,
+        timestamp: cameraToNumber(timestamp),
+        spawnedAt: Date.now()
+      });
+      hookImageGetters(img);
+    }
+
+    function hookImageGetters(img) {
+      let className;
+      try { className = img.getClass().getName(); } catch (e) { return; }
+      if (cameraHookedImageClasses.has(className)) return;
+      cameraHookedImageClasses.add(className);
+      let ImageClass;
+      try { ImageClass = Java.use(className); } catch (e) { return; }
+      ['getWidth', 'getHeight', 'getFormat', 'getTimestamp'].forEach(function (methodName) {
+        try {
+          ImageClass[methodName].overloads.forEach(function (ov) {
+            if (ov.argumentTypes.length !== 0) return;
+            ov.implementation = function () {
+              const info = cameraShadowImageInfo.get(cameraIdOf(this));
+              if (info === undefined) return ov.apply(this, arguments);
+              return {
+                getWidth: info.w, getHeight: info.h,
+                getFormat: info.format, getTimestamp: info.timestamp
+              }[methodName];
+            };
+            appliedCamera2Hooks.push(ov);
+          });
+        } catch (e) {}
+      });
+      try {
+        ImageClass.close.overloads.forEach(function (ov) {
+          if (ov.argumentTypes.length !== 0) return;
+          ov.implementation = function () {
+            const imgId = cameraIdOf(this);
+            if (cameraShadowImageInfo.has(imgId)) cameraShadowImageInfo.delete(imgId);
+            return ov.apply(this, arguments);
+          };
+          appliedCamera2Hooks.push(ov);
+        });
+      } catch (e) {}
+    }
+
+    function onNewReaderCreated(reader, args, argTypes) {
+      const readerId = cameraReaderKey(reader);
+      if (cameraShadowReaderIds.has(readerId)) return;
+      let w = null, h = null, format = null;
+      for (let i = 0; i < argTypes.length; i++) {
+        if (argTypes[i].className !== 'int') continue;
+        if (w === null) w = args[i];
+        else if (h === null) h = args[i];
+        else if (format === null) format = args[i];
+      }
+      // Note: shadow readers are created with h=1, which falls below
+      // CAM_L2_MIN_STILL_H — so a shadow reader will never register as
+      // a still-capture target, preventing recursive shadow creation.
+      const isStillCaptureReader = (format === CAM_IMAGE_FORMAT_JPEG
+        && w >= CAM_L2_MIN_STILL_W && h >= CAM_L2_MIN_STILL_H);
+      if (!isStillCaptureReader) return;
+      const shadowSize = computeShadowSize(w, h);
+      if (shadowSize === null) {
+        logW('[CameraMock][L2] skipping id=' + readerId + ' ' + w + 'x' + h
+          + ' (shadow > ' + CAM_L2_SHADOW_SIZE_CAP_MB + 'MB cap)');
+        return;
+      }
+      logI('[CameraMock][L2] newInstance id=' + readerId + ' ' + w + 'x' + h
+        + ' <- target, shadow=' + ((shadowSize / 1048576) | 0) + 'MB');
+      cameraReaderRegistry.set(readerId, {
+        w: w, h: h, format: format, realReader: reader,
+        shadowSize: shadowSize,
+        shadow: null, lastShadowImgId: null, consecutiveBad: 0,
+      });
+      createShadowForReader(readerId);
+      hookReaderConcreteClass(reader);
+    }
+
+    function createShadowForReader(readerId) {
+      try {
+        const info = cameraReaderRegistry.get(readerId);
+        if (!info) return;
+        if (info.shadow) {
+          try { if (info.shadow.writer) info.shadow.writer.close(); } catch (e) {}
+          try { info.shadow.reader.close(); } catch (e) {}
+          cameraShadowReaderIds.delete(cameraReaderKey(info.shadow.reader));
+        }
+        const shadowReader = ImageReader.newInstance(info.shadowSize, 1, CAM_IMAGE_FORMAT_JPEG, CAM_L2_SHADOW_MAX_IMAGES);
+        cameraShadowReaderIds.add(cameraReaderKey(shadowReader));
+        const shadowWriter = ImageWriter.newInstance.overload('android.view.Surface', 'int').call(
+          ImageWriter, shadowReader.getSurface(), CAM_L2_SHADOW_MAX_IMAGES);
+        info.shadow = { reader: shadowReader, writer: shadowWriter };
+        info.consecutiveBad = 0;
+        cameraReaderRegistry.set(readerId, info);
+        logI('[CameraMock][L2] shadow created id=' + readerId + ' (' + ((info.shadowSize / 1048576) | 0) + 'MB)');
+        if (cameraMockValues.toastOnReady) {
+          cameraShowToast(cameraMockValues.toastReadyText, false);
+        }
+      } catch (e) {
+        logE('[CameraMock][L2] shadow creation failed id=' + readerId + ': ' + e);
+        if (cameraMockValues.toastOnFailure) {
+          cameraShowToast(cameraMockValues.toastFailText, true);
+        }
+      }
+    }
+
+    function hookReaderConcreteClass(realReader) {
+      let className;
+      try { className = realReader.getClass().getName(); } catch (e) { return; }
+      if (cameraHookedReaderClasses.has(className)) return;
+      cameraHookedReaderClasses.add(className);
+      let ReaderClass;
+      try { ReaderClass = Java.use(className); }
+      catch (e) { logE('[CameraMock][L2] Java.use(' + className + ') failed: ' + e); return; }
+      ['acquireNextImage', 'acquireLatestImage'].forEach(function (methodName) {
+        try {
+          ReaderClass[methodName].overloads.forEach(function (ov) {
+            ov.implementation = function () { return handleAcquireCall(this, ov, methodName, arguments); };
+            appliedCamera2Hooks.push(ov);
+          });
+        } catch (e) { logE('[CameraMock][L2] ' + methodName + ' hook failed: ' + e); }
+      });
+    }
+
+    function handleAcquireCall(reader, originalOv, methodName, callArgs) {
+      const readerId = cameraReaderKey(reader);
+      const info = cameraReaderRegistry.get(readerId);
+      if (!info || !info.shadow) return originalOv.apply(reader, callArgs);
+      if (info.lastShadowImgId !== null && cameraShadowImageInfo.has(info.lastShadowImgId)) {
+        logW('[CameraMock][L2] previous shadow image id=' + readerId + ' was never closed');
+      }
+      let realImg = null;
+      try { realImg = originalOv.apply(reader, callArgs); }
+      catch (e) { logE('[CameraMock][L2] real ' + methodName + ' threw: ' + e); return null; }
+      if (realImg === null) return null;
+      let realTimestamp = 0;
+      try { realTimestamp = cameraToNumber(realImg.getTimestamp()); } catch (e) {}
+      let jpegBytes = null;
+      try { jpegBytes = cameraGetJpegForDimensions(info.w, info.h); }
+      catch (e) { logE('[CameraMock][L2] mock jpeg acquisition failed: ' + e); }
+      let shadowImg = null, pollAttempts = 0;
+      if (jpegBytes !== null) {
+        const requiredBytes = jpegBytes.length + CAM_JPEG_TRAILER_SIZE;
+        const dequeueResult = tryDequeueSufficientBuffer(info, requiredBytes);
+        if (dequeueResult.image !== null) {
+          try {
+            writeJpegIntoBuffer(dequeueResult.image, jpegBytes);
+            try { dequeueResult.image.setTimestamp(realTimestamp); } catch (e) {}
+            info.shadow.writer.queueInputImage(dequeueResult.image);
+            for (let attempt = 0; attempt < CAM_ACQUIRE_POLL_ATTEMPTS; attempt++) {
+              try { shadowImg = info.shadow.reader.acquireLatestImage(); }
+              catch (e) { break; }
+              if (shadowImg !== null) { pollAttempts = attempt + 1; break; }
+              try { Thread.sleep.overload('long').call(Thread, CAM_ACQUIRE_POLL_INTERVAL_MS); } catch (e) { break; }
+            }
+            info.consecutiveBad = 0;
+          } catch (e) {
+            logE('[CameraMock][L2] write/queue failed id=' + readerId + ': ' + e);
+            if (('' + e).indexOf('buffer too small') >= 0) {
+              logW('[CameraMock][L2] recreating shadow for id=' + readerId + ' (buffer shrank)');
+              createShadowForReader(readerId);
+            }
+          }
+        } else {
+          info.consecutiveBad++;
+          logW('[CameraMock][L2] no sufficient buffer id=' + readerId
+            + ' rejected=[' + dequeueResult.rejectedCapacities.join(',') + '] consecutiveBad=' + info.consecutiveBad);
+          if (info.consecutiveBad >= CAM_MAX_CONSECUTIVE_BAD_BUFFERS) {
+            logW('[CameraMock][L2] recreating shadow id=' + readerId + ' after ' + info.consecutiveBad + ' bad buffers');
+            createShadowForReader(readerId);
+            info.consecutiveBad = 0;
+          }
+        }
+        cameraReaderRegistry.set(readerId, info);
+      }
+      if (shadowImg !== null) {
+        try { realImg.close(); } catch (e) {}
+        markAsShadowImage(shadowImg, info.w, info.h, CAM_IMAGE_FORMAT_JPEG, realTimestamp);
+        info.lastShadowImgId = cameraIdOf(shadowImg);
+        cameraReaderRegistry.set(readerId, info);
+        logI('[CameraMock][L2] SUBSTITUTED id=' + readerId + ' jpeg=' + jpegBytes.length + 'B poll=' + pollAttempts);
+        return shadowImg;
+      }
+      logW('[CameraMock][L2] falling back to real image id=' + readerId + ' poll=' + pollAttempts);
+      return realImg;
+    }
+
+    // ---- Hook: ImageReader.newInstance ----
+    ImageReader.newInstance.overloads.forEach(function (ov) {
+      const argTypes = ov.argumentTypes;
+      ov.implementation = function () {
+        const args = Array.prototype.slice.call(arguments);
+        const reader = ov.apply(this, args);
+        try { onNewReaderCreated(reader, args, argTypes); }
+        catch (e) { logE('[CameraMock][L2] onNewReaderCreated failed: ' + e); }
+        return reader;
+      };
+      appliedCamera2Hooks.push(ov);
+    });
+    logI('[CameraMock][L2] hooked ImageReader.newInstance (' + ImageReader.newInstance.overloads.length + ' overload(s))');
+
+    // ---- Hook: ImageReader.close ----
+    try {
+      const closeOv = ImageReader.close.overload();
+      closeOv.implementation = function () {
+        try {
+          const readerId = cameraReaderKey(this);
+          const info = cameraReaderRegistry.get(readerId);
+          if (info && info.shadow) {
+            try { if (info.shadow.writer) info.shadow.writer.close(); } catch (e) {}
+            try { info.shadow.reader.close(); } catch (e) {}
+            cameraShadowReaderIds.delete(cameraReaderKey(info.shadow.reader));
+            cameraReaderRegistry.delete(readerId);
+          }
+        } catch (e) {}
+        return closeOv.call(this);
+      };
+      appliedCamera2Hooks.push(closeOv);
+      logI('[CameraMock][L2] hooked ImageReader.close');
+    } catch (e) { logE('[CameraMock][L2] ImageReader.close hook failed: ' + e); }
+
+    logI('[CameraMock][L2] ready (source=' + cameraMockValues.jpegSource + ')');
+  } catch (err) {
+    logE('[CameraMock][L2] setup failed: ' + err);
+    throw err;
+  }
+}
+
+// ------------------------------------------------------------------
+// Camera-mock master apply + revert
+// ------------------------------------------------------------------
+
+function applyCameraMock(values) {
+  if (cameraMockApplied) {
+    logW('[CameraMock] hooks already applied — skipping re-application');
+    return;
+  }
+  cameraMockApplied = true;
+  logI('[CameraMock] applying (L1=' + values.layer1Enabled
+    + ' L2=' + values.layer2Enabled + ' source=' + values.jpegSource + ')');
+  if (values.layer1Enabled) {
+    try { applyCameraIntentMock(values); }
+    catch (err) { logE('[CameraMock][L1] setup failed: ' + err); }
+  } else {
+    logD('[CameraMock] Layer 1 disabled by config');
+  }
+  if (values.layer2Enabled) {
+    try { applyCamera2Mock(values); }
+    catch (err) { logE('[CameraMock][L2] setup failed: ' + err); }
+  } else {
+    logD('[CameraMock] Layer 2 disabled by config');
+  }
+}
+
+function revertCameraIntentMock() {
+  for (const target of appliedCameraIntentHooks) {
+    try { target.implementation = null; }
+    catch (err) { logW('[CameraMock][L1] Failed to revert a hook: ' + err); }
+  }
+  appliedCameraIntentHooks.length = 0;
+  cameraPendingLaunches.clear();
+  logI('[*] [CameraMock][L1] intent-mock hooks reverted.');
+}
+
+function revertCamera2Mock() {
+  for (const target of appliedCamera2Hooks) {
+    try { target.implementation = null; }
+    catch (err) { logW('[CameraMock][L2] Failed to revert a hook: ' + err); }
+  }
+  appliedCamera2Hooks.length = 0;
+  for (const [, info] of cameraReaderRegistry) {
+    try { if (info.shadow && info.shadow.writer) info.shadow.writer.close(); } catch (e) {}
+    try { if (info.shadow && info.shadow.reader) info.shadow.reader.close(); } catch (e) {}
+  }
+  cameraReaderRegistry.clear();
+  cameraShadowReaderIds.clear();
+  cameraShadowImageInfo.clear();
+  cameraHookedReaderClasses.clear();
+  cameraHookedImageClasses.clear();
+  cameraJpegCache.clear();
+  logI('[*] [CameraMock][L2] Camera2-mock hooks reverted.');
+}
+
+function revertCameraMock() {
+  revertCameraIntentMock();
+  revertCamera2Mock();
+  cameraLastPickedBytes = null;
+  cameraLastPickedSource = null;
+  cameraBypassActive = false;
+  cameraMockApplied = false;
+  logI('[*] Camera mock reverted.');
+}
+
+/**
  * Resolves a boolean configuration flag, preferring the value
  * supplied in Gadget's parameters object over the module-level
  * default when present and correctly typed. If the key is present
@@ -6168,6 +7459,8 @@ rpc.exports = {
     registerNativesLogEnabled = resolveBooleanFlag(parameters, 'registerNativesLogEnabled', registerNativesLogEnabled);
     registerNativesLogClassFilter = resolveStringArrayValue(parameters, 'registerNativesLogClassFilter', registerNativesLogClassFilter);
     registerNativesLogLocator = resolveMergedStringMap(parameters, 'registerNativesLogLocator', registerNativesLogLocator);
+    cameraMockEnabled = resolveBooleanFlag(parameters, 'cameraMockEnabled', cameraMockEnabled);
+    cameraMockValues = resolveTypedMap(parameters, 'cameraMockValues', cameraMockValues);
     sslPinningBypassEnabled = resolveBooleanFlag(parameters, 'sslPinningBypassEnabled', sslPinningBypassEnabled);
 
     // Random values are computed once here, so that both
@@ -6176,7 +7469,7 @@ rpc.exports = {
     // map below observe the same generated identifiers.
     const effectiveDeviceIdValues = deviceIdSpoofUseRandom ? generateRandomDeviceIdValues() : deviceIdSpoofValues;
 
-    logI(`[init] stage=${stage} debugLog=${debugLoggingEnabled} installerSpoofEnabled=${installerSpoofEnabled} adbDevSettingsBypassEnabled=${adbDevSettingsBypassEnabled} mockLocationBypassEnabled=${mockLocationBypassEnabled} autoTimeSpoofEnabled=${autoTimeSpoofEnabled} pairipLicenseBypassEnabled=${pairipLicenseBypassEnabled} flagSecureBypassEnabled=${flagSecureBypassEnabled} vpnProxyBypassEnabled=${vpnProxyBypassEnabled} geoRestrictionBypassEnabled=${geoRestrictionBypassEnabled} localeSpoofEnabled=${localeSpoofEnabled} suspiciousPackageSpoofEnabled=${suspiciousPackageSpoofEnabled} installedPackageSpoofEnabled=${installedPackageSpoofEnabled} deviceIdSpoofEnabled=${deviceIdSpoofEnabled} deviceIdSpoofUseRandom=${deviceIdSpoofUseRandom} buildPropSpoofEnabled=${buildPropSpoofEnabled} systemPropertySpoofEnabled=${systemPropertySpoofEnabled} hardwareFeatureSpoofEnabled=${hardwareFeatureSpoofEnabled} contentProviderSpoofEnabled=${contentProviderSpoofEnabled} javaHooksEnabled=${javaHooksEnabled} nativeHooksEnabled=${nativeHooksEnabled} nativePatchesEnabled=${nativePatchesEnabled} registerNativesLogEnabled=${registerNativesLogEnabled} sslPinningBypassEnabled=${sslPinningBypassEnabled}`);
+    logI(`[init] stage=${stage} debugLog=${debugLoggingEnabled} installerSpoofEnabled=${installerSpoofEnabled} adbDevSettingsBypassEnabled=${adbDevSettingsBypassEnabled} mockLocationBypassEnabled=${mockLocationBypassEnabled} autoTimeSpoofEnabled=${autoTimeSpoofEnabled} pairipLicenseBypassEnabled=${pairipLicenseBypassEnabled} flagSecureBypassEnabled=${flagSecureBypassEnabled} vpnProxyBypassEnabled=${vpnProxyBypassEnabled} geoRestrictionBypassEnabled=${geoRestrictionBypassEnabled} localeSpoofEnabled=${localeSpoofEnabled} suspiciousPackageSpoofEnabled=${suspiciousPackageSpoofEnabled} installedPackageSpoofEnabled=${installedPackageSpoofEnabled} deviceIdSpoofEnabled=${deviceIdSpoofEnabled} deviceIdSpoofUseRandom=${deviceIdSpoofUseRandom} buildPropSpoofEnabled=${buildPropSpoofEnabled} systemPropertySpoofEnabled=${systemPropertySpoofEnabled} hardwareFeatureSpoofEnabled=${hardwareFeatureSpoofEnabled} contentProviderSpoofEnabled=${contentProviderSpoofEnabled} javaHooksEnabled=${javaHooksEnabled} nativeHooksEnabled=${nativeHooksEnabled} nativePatchesEnabled=${nativePatchesEnabled} registerNativesLogEnabled=${registerNativesLogEnabled} cameraMockEnabled=${cameraMockEnabled} sslPinningBypassEnabled=${sslPinningBypassEnabled}`);
     logD(`[init] parameters = ${JSON.stringify(parameters)}`);
     logD(`[init] effectiveDeviceIdValues = ${JSON.stringify(effectiveDeviceIdValues)}`);
 
@@ -6341,6 +7634,10 @@ rpc.exports = {
             applyRegisterNativesLog(registerNativesLogClassFilter, registerNativesLogLocator);
           }
 
+          if (cameraMockEnabled) {
+            applyCameraMock(cameraMockValues);
+          }
+
           // applySslPinningBypass() is intentionally last: its Interceptor.attach
           // trampoline on libflutter.so must be allocated AFTER nativePatches has
           // written its raw instruction bytes. If SSL installs first, a patch
@@ -6457,6 +7754,11 @@ rpc.exports = {
     }
     if (registerNativesLogEnabled) {
       revertRegisterNativesLog();
+    }
+    if (cameraMockEnabled) {
+      Java.performNow(function () {
+        revertCameraMock();
+      });
     }
     // Reverted last, mirroring applySslPinningBypass() being applied last
     // in init() (see the ordering comment there re: the native trampoline

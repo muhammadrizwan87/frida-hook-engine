@@ -598,6 +598,25 @@
       "registerNativesLogLocator": {
         "symbolName": "",
         "offset": ""
+      },
+
+      // ------------------------------------------------------------------
+      // Camera input mock — Layer 1 (intent-based capture redirect) and
+      // Layer 2 (Camera2 in-process still-capture substitution).
+      // Both layers are off by default; flip the flag to true to enable.
+      // ------------------------------------------------------------------
+      "cameraMockEnabled": false,
+      // Configuration values for the camera-mock module. Ignored while
+      // cameraMockEnabled is false.
+      "cameraMockValues": {
+        "layer1Enabled": true,
+        "layer2Enabled": true,
+        // "jpegSource": "/storage/emulated/0/Pictures/mock.jpg",
+        "jpegSource": "placeholder",
+        "toastOnReady": true,
+        "toastReadyText": "cam-mock: ready",
+        "toastOnFailure": true,
+        "toastFailText": "cam-mock: NOT READY - real image will be captured"
       }
     }
   }
